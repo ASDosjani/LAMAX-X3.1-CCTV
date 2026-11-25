@@ -1,0 +1,38 @@
+# --- build output -----------------------------------------------------------
+out/
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# camera binaries are built (build.sh) or taken from a GitHub release
+sdcard/cam/bin/
+
+# --- device data: never commit -----------------------------------------------
+# flash backups contain the manufacturer's firmware and device identifiers
+backups/
+lamax_x31_backup_*/
+*.bin
+# boot images are built from a camera's own backup (they contain its kernel)
+*.img
+# logs / scan results copied from a camera's SD card
+log*.txt
+wifi_scan.txt
+wpa_log.txt
+
+# --- local settings that may hold WiFi or RTSP passwords ---------------------
+config.local.txt
+LamaxTool_settings.txt
+*.local.txt
+
+# --- editors / OS ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# personal working notes (Hungarian)
+LAMAX_X31_jegyzetek.md

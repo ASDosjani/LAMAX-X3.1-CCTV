@@ -1,0 +1,17 @@
+# Shell scripts run on the camera (mksh) and in WSL: they must keep LF line
+# endings even on a Windows checkout, or the camera cannot run them.
+*.sh            text eol=lf
+*.c             text eol=lf
+*.h             text eol=lf
+*.py            text eol=lf
+*.md            text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# Edited with Notepad by users; the camera's config parser accepts CRLF.
+sdcard/cam/config.txt  text eol=crlf
+*.ps1           text eol=crlf
+
+*.bin           binary
+*.img           binary
+*.exe           binary

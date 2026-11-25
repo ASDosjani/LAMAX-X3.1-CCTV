@@ -1,0 +1,102 @@
+# LAMAX X3.1 security camera - settings
+# Format: KEY=value   (lines starting with # are comments)
+# Changes take effect the next time the camera is switched on.
+
+# --- Mode -------------------------------------------------------------------
+# camera = security camera (RTSP stream)
+# stock  = original camera software (this SD card does nothing)
+MODE=camera
+
+# Camera name (shown on the screen and in the stream description)
+CAMERA_NAME=camera1
+
+# --- WiFi (2.4 GHz networks only!) ------------------------------------------
+# WPA2-PSK (8..63 characters) or empty for an open network. The password is
+# stored in clear text: put the cameras on a separate guest / IoT network.
+WIFI_SSID=
+WIFI_PASSWORD=
+
+# --- IP address -------------------------------------------------------------
+# dhcp   = address from the router
+# static = fixed address (recommended for an NVR)
+IP_MODE=dhcp
+IP_ADDRESS=192.168.1.50
+IP_NETMASK=255.255.255.0
+IP_GATEWAY=192.168.1.1
+IP_DNS=192.168.1.1
+
+# --- Video ------------------------------------------------------------------
+# Resolution: 1920x1080 or 1280x720
+VIDEO_WIDTH=1920
+VIDEO_HEIGHT=1080
+# Frames per second (1..30)
+VIDEO_FPS=25
+# Bitrate in kbit/s (1080p: 3000-6000, 720p: 1500-3000)
+VIDEO_BITRATE_KBPS=4000
+# Key frame (I-frame) interval in seconds
+VIDEO_GOP_SECONDS=2
+# baseline / main / high
+VIDEO_PROFILE=main
+# 1 = rotate the picture by 180 degrees (camera mounted upside down)
+VIDEO_FLIP=0
+
+# --- RTSP -------------------------------------------------------------------
+# Stream URL: rtsp://<IP>:<RTSP_PORT>/<RTSP_PATH>
+RTSP_PORT=554
+RTSP_PATH=stream
+# If set, the NVR needs this user name / password (Digest and Basic auth)
+RTSP_USER=
+RTSP_PASSWORD=
+RTSP_MAX_CLIENTS=4
+
+# --- Time stamp in the picture ----------------------------------------------
+# 1 = date and time burned into the video, 0 = none
+OSD_TIME=1
+# top-left / top-right / bottom-left / bottom-right
+OSD_POSITION=top-left
+# 1 = also show CAMERA_NAME before the time
+OSD_NAME=0
+# Time zone as a POSIX TZ string (the camera has no time zone database):
+#   Central Europe (Budapest, Berlin, Paris): CET-1CEST,M3.5.0,M10.5.0/3
+#   UK / Portugal:                            GMT0BST,M3.5.0/1,M10.5.0
+#   Eastern Europe (Helsinki, Athens):        EET-2EEST,M3.5.0/3,M10.5.0/4
+#   UTC:                                      UTC0
+TIMEZONE=CET-1CEST,M3.5.0,M10.5.0/3
+# Network time server. The camera fetches the time after joining WiFi and then
+# every 6 hours; the WiFi router is tried too if this server does not answer.
+NTP_SERVER=pool.ntp.org
+
+# --- Screen -----------------------------------------------------------------
+# The screen (and its backlight) turns off after this many seconds
+# (0 = always on). Any button shows it again for the same time.
+SCREEN_TIMEOUT=60
+
+# --- LEDs -------------------------------------------------------------------
+# on  = the blue and the top yellow LED show the state:
+#         short flash every 4 s     -> all fine, nobody is watching
+#         soft flash every 2 s      -> someone is watching the stream
+#         fast blinking             -> no WiFi / no IP address yet
+#         double flash every second -> error, the stream program is not running
+# off = both LEDs off
+# (The red LED is the charger's own indicator and cannot be switched.)
+LED=on
+
+# --- Battery ----------------------------------------------------------------
+# 1 = charge only to 4.10 V (about 85-90 %) instead of 4.20 V. Much kinder to a
+#     battery that sits on external power all the time (less wear and swelling).
+# 0 = normal charging to 100 %.
+# (The charger chip cannot stop at an exact percentage.)
+BATTERY_LONG_LIFE=1
+
+# --- Log --------------------------------------------------------------------
+# sd  = cam/log.txt on the SD card (at most 2 x 512 KB, rotated automatically)
+# ram = in RAM only, nothing is written to the card (lost at power-off,
+#       readable with: adb shell cat /dev/cam/log.txt)
+# off = no log
+LOG=sd
+
+# --- Other ------------------------------------------------------------------
+# 1 = reboot the camera if the stream program hangs (recommended)
+WATCHDOG=1
+# 1 = detailed WiFi log on the SD card (cam/wpa_log.txt, at most 2 x 1 MB), for troubleshooting
+WIFI_DEBUG_LOG=0
