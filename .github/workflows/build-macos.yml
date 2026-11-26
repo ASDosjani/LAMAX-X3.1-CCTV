@@ -1,0 +1,68 @@
+# Builds LamaxTool for Apple Silicon Macs (PyInstaller cannot cross-compile).
+# 1. camera: the camera programs (NDK r21e + wpa_supplicant), as in docs/BUILD.md
+# 2. macos:  LamaxTool.app on an arm64 macOS runner, uploaded as a zip artifact
+# Run it from the Actions tab (Run workflow) or by pushing a change to the tool.
+name: Build LamaxTool for macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [tools/**, boot/**, sdcard/**, src/**, build.sh, third_party/**, .github/workflows/build-macos.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  camera:
+    runs-on: ubuntu-22.04
+    env:
+      NDK: ${{ github.workspace }}/../android-ndk-r21e
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache NDK r21e
+        id: ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../android-ndk-r21e
+          key: android-ndk-r21e-linux
+      - name: Download NDK r21e
+        if: steps.ndk.outputs.cache-hit != 'true'
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          curl -sSfLO https://dl.google.com/android/repository/android-ndk-r21e-linux-x86_64.zip
+          echo "c3ebc83c96a4d7f539bd72c241b2be9dcd29bda9  android-ndk-r21e-linux-x86_64.zip" | sha1sum -c -
+          unzip -q android-ndk-r21e-linux-x86_64.zip && rm android-ndk-r21e-linux-x86_64.zip
+      - name: Build wpa_supplicant
+        run: bash third_party/build_wpa.sh
+      - name: Build camera programs
+        run: bash build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: camera-bin
+          path: sdcard/cam/bin/
+          if-no-files-found: error
+
+  macos:
+    needs: camera
+    runs-on: macos-14            # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: camera-bin
+          path: sdcard/cam/bin
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build LamaxTool.app
+        run: bash tools/build_macos.sh
+      - name: Show binary type and signature
+        run: |
+          file dist/LamaxTool.app/Contents/MacOS/LamaxTool
+          codesign -dv dist/LamaxTool.app 2>&1 | head -3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LamaxTool-macOS-arm64
+          path: dist/LamaxTool-macOS-arm64.zip
+          if-no-files-found: error

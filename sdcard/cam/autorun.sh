@@ -24,11 +24,11 @@ get() { $RUN/camnet get $CFG "$1" "$2"; }
 # --- log --------------------------------------------------------------------
 # LOG=sd  : cam/log.txt on the SD card, at most 2 x 512 KB (log.txt + log.txt.old)
 # LOG=ram : /dev/cam/log.txt in RAM only (lost at power-off), at most 2 x 128 KB
-# LOG=off : no log
-case "$(get LOG sd)" in
-    off) LOG=/dev/null; LOG_MAX=0 ;;
+# LOG=off : no log (default)
+case "$(get LOG off)" in
+    sd)  LOG=$SD/log.txt; LOG_MAX=524288 ;;
     ram) LOG=$RUN/log.txt; LOG_MAX=131072 ;;
-    *)   LOG=$SD/log.txt; LOG_MAX=524288 ;;
+    *)   LOG=/dev/null; LOG_MAX=0 ;;
 esac
 # Every program started from here appends to the same file (O_APPEND), so it can
 # be rotated at run time by copying it to .old and truncating it in place.
@@ -147,6 +147,12 @@ CAMLED=$!
 BAT=/sys/class/power_supply/battery
 if [ "$(get BATTERY_LONG_LIFE 1)" = "1" ]; then CHG_UV=4100000; else CHG_UV=4200000; fi
 [ -w $BAT/chgen ] && echo 1 > $BAT/chgen        # undo anything older versions did
+# Hardware cut-off (AXP209 VOFF, reg 0x31 bits 2-0): 2.9 V stock, 3.1 V in long-life mode
+# as a backstop. The normal early shutdown (10 % / 3.45 V) is done by camui.
+AXP=/sys/bus/i2c/devices/0-0034/axp20_reg      # writes need axp20_reg (RRVV)
+if [ -w $AXP ]; then
+    if [ "$(get BATTERY_LONG_LIFE 1)" = "1" ]; then echo 3105 > $AXP; else echo 3103 > $AXP; fi
+fi
 charge_limit() {
     [ -w $BAT/chgmicrovol ] || return
     if [ "$(cat $BAT/chgmicrovol)" != "$CHG_UV" ]; then

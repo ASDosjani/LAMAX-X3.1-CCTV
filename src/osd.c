@@ -3,6 +3,7 @@
  * into a small mask once per second; each frame only copies the mask. */
 #include "osd.h"
 #include "font8x16.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -13,22 +14,30 @@
 
 struct osd {
     int fw, fh;             /* frame size */
-    int scale, edge;        /* font scale, outline thickness (pixels) */
+    int s2, edge;           /* font scale in half steps (3 = 1.5x), outline thickness (pixels) */
+    int cw, ch;             /* character cell size in the frame */
     int x, y;               /* mask position in the frame (even) */
     int right, bottom;      /* anchored to the right / bottom edge */
     char name[32];
+    int battery;            /* show the battery percentage while on battery */
     time_t shown;           /* second the mask was made for */
     int mw, mh;             /* mask size */
     uint8_t *mask;          /* 0 = video, 1 = outline, 2 = text */
 };
 
-osd_t *osd_create(int width, int height, const char *position, const char *name)
+osd_t *osd_create(int width, int height, const char *position, const char *name, int battery)
 {
     osd_t *o = calloc(1, sizeof(*o));
     if (!o) return NULL;
+    o->battery = battery;
     o->fw = width; o->fh = height;
-    o->scale = height >= 1000 ? 3 : 2;            /* 48 px text at 1080p, 32 px at 720p */
-    o->edge = o->scale >= 3 ? 2 : 1;
+    /* text about 3.2 % of the frame height, in half steps of the 8x16 font:
+     * 1520p 48 px (3x), 1080p 32 px (2x), 720p 24 px (1.5x) */
+    o->s2 = (height * 6 + 760) / 1520;
+    if (o->s2 < 2) o->s2 = 2;
+    o->edge = o->s2 >= 6 ? 2 : 1;
+    o->cw = 4 * o->s2;                            /* 8 * s2 / 2 */
+    o->ch = 8 * o->s2;                            /* 16 * s2 / 2 */
     o->right = position && strstr(position, "right") != NULL;
     o->bottom = position && strstr(position, "bottom") != NULL;
     if (name) {
@@ -40,27 +49,47 @@ osd_t *osd_create(int width, int height, const char *position, const char *name)
         }
     }
     o->shown = -1;
-    o->mask = malloc((size_t)(OSD_MAXCHARS * 8 * o->scale + 2 * o->edge) * (16 * o->scale + 2 * o->edge));
+    o->mask = malloc((size_t)(OSD_MAXCHARS * o->cw + 2 * o->edge) * (o->ch + 2 * o->edge));
     if (!o->mask) { free(o); return NULL; }
     return o;
+}
+
+static int read_int(const char *path, int dflt)
+{
+    FILE *f = fopen(path, "r");
+    int v = dflt;
+    if (f) { if (fscanf(f, "%d", &v) != 1) v = dflt; fclose(f); }
+    return v;
+}
+
+/* battery percentage while the camera runs from its battery, else -1
+ * (external power, or no battery fitted) */
+static int battery_pct(void)
+{
+#define PS "/sys/class/power_supply/"
+    if (read_int(PS "battery/present", 1) == 0) return -1;
+    if (read_int(PS "usb/online", 0) || read_int(PS "ac/online", 0)) return -1;
+    return read_int(PS "battery/capacity", -1);
+#undef PS
 }
 
 static void render(osd_t *o, const char *text)
 {
     int n = (int)strlen(text);
     if (n > OSD_MAXCHARS) n = OSD_MAXCHARS;
-    const int sc = o->scale, ed = o->edge;
-    o->mw = n * 8 * sc + 2 * ed;
-    o->mh = 16 * sc + 2 * ed;
+    const int ed = o->edge, s2 = o->s2;
+    o->mw = n * o->cw + 2 * ed;
+    o->mh = o->ch + 2 * ed;
     memset(o->mask, 0, (size_t)o->mw * o->mh);
-    /* glyphs */
+    /* glyphs, nearest neighbour (at 1.5x every other font pixel is 2 wide) */
     for (int i = 0; i < n; i++) {
         const unsigned char *g = font8x16 + (unsigned char)text[i] * 16;
-        for (int gy = 0; gy < 16; gy++)
-            for (int gx = 0; gx < 8; gx++)
-                if (g[gy] & (0x80 >> gx))
-                    for (int dy = 0; dy < sc; dy++)
-                        memset(o->mask + (size_t)(ed + gy * sc + dy) * o->mw + ed + (i * 8 + gx) * sc, 2, sc);
+        for (int oy = 0; oy < o->ch; oy++) {
+            unsigned char bits = g[oy * 2 / s2];
+            uint8_t *row = o->mask + (size_t)(ed + oy) * o->mw + ed + i * o->cw;
+            for (int ox = 0; ox < o->cw; ox++)
+                if (bits & (0x80 >> (ox * 2 / s2))) row[ox] = 2;
+        }
     }
     /* outline: every video pixel within `edge` of a text pixel */
     for (int y = 0; y < o->mh; y++)
@@ -94,8 +123,10 @@ void osd_draw(osd_t *o, uint8_t *y, uint8_t *uv, int stride)
             strcpy(when, "----------  --:--:--");
         else
             strftime(when, sizeof(when), "%Y-%m-%d  %H:%M:%S", &tm);
-        if (o->name[0]) snprintf(text, sizeof(text), "%s  %s", o->name, when);
-        else snprintf(text, sizeof(text), "%s", when);
+        char bat[16] = "";
+        int pct = o->battery ? battery_pct() : -1;
+        if (pct >= 0) snprintf(bat, sizeof(bat), "  BAT %d%%", pct);
+        snprintf(text, sizeof(text), "%s%s%s%s", o->name, o->name[0] ? "  " : "", when, bat);
         render(o, text);
         o->shown = now;
     }

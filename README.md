@@ -21,20 +21,26 @@ WiFi security camera: after power-on it joins your WiFi and serves an
 
 | | |
 |---|---|
-| Video | 1920×1080 or 1280×720, 1–30 fps, H.264 baseline/main/high, hardware encoder (≈13 ms per 1080p frame) |
+| Video | 2688×1520 (2.7K), 1920×1080 or 1280×720, 1–30 fps, H.264 baseline/main/high, hardware encoder (≈13 ms per 1080p frame, ≈27 ms at 2688×1520) |
 | RTSP | `rtsp://<ip>:554/stream`, RTP over UDP or TCP (interleaved), Digest + Basic auth, up to 8 clients |
 | Network | 2.4 GHz WiFi, WPA2-PSK or open, DHCP or static IP, automatic reconnect |
-| Time stamp | date and time burned into the picture (optionally with the camera name), any corner; time from the network (SNTP), POSIX time zone |
+| Time stamp | date and time burned into the picture (optionally with the camera name, and the battery percentage while there is no external power), any corner; time from the network (SNTP), POSIX time zone |
 | Screen | status page: WiFi name, **live signal strength (dBm)** for finding a good mounting spot, IP, clients, bitrate, battery / DC icon; WiFi scan page; sleeps after 60 s, wakes on any button |
 | LEDs | blue + top yellow LED show the state (see below), or off |
-| Battery | percentage and charging shown on screen; optional long-life charging (4.10 V ≈ 85–90 %) |
+| Battery | percentage and charging shown on screen; optional long-life mode: charge to 4.10 V (≈ 85–90 %) and switch off at 10 % instead of draining the cell |
 | Robustness | hardware watchdog (reboot if the stream hangs), supervisor restarts every part, boot-loop protection, logs on the SD card |
 
 ## Quick start
 
-1. Download LamaxTool from the [Releases](../../releases) page – `LamaxTool.exe` for
-   Windows or `LamaxTool` for Linux (x86-64) – or build it, see [docs/BUILD.md](docs/BUILD.md).
+1. Get LamaxTool: the ready-built programs are in the repository's [`dist/`](dist) folder –
+   `LamaxTool.exe` for Windows, `LamaxTool` for Linux (x86-64) – and on the
+   [Releases](../../releases) page. For **Apple Silicon Macs** the GitHub Actions workflow
+   *Build LamaxTool for macOS* builds `LamaxTool-macOS-arm64.zip` (Actions tab → latest run →
+   Artifacts). Building it yourself is optional, see [docs/BUILD.md](docs/BUILD.md).
    It contains the camera programs and the boot hook.
+   *macOS:* the app is not signed by Apple – the first time, right-click it → **Open** (or run
+   `xattr -dr com.apple.quarantine LamaxTool.app`). It keeps backups, adb and its settings in
+   `~/LamaxTool`.
 2. Plug the camera into the computer with a USB data cable and choose **mass storage**
    on the camera when it asks. adb (Android platform-tools) is downloaded from Google
    on first use if it is not found.
@@ -54,13 +60,18 @@ WiFi security camera: after power-on it joins your WiFi and serves an
       networks the camera sees (see below), so the name can be picked instead of typed. Settings can be loaded from a `config.txt` file or straight from the
       camera's SD card, saved to a file (e.g. as a template for more cameras) or reset to defaults.
       Then **Write to camera SD card** (or **Write to drive / folder** for a card in a card reader).
-      An existing `config.txt` on the card is only replaced when *Overwrite existing config.txt* is ticked.
+      The card's `config.txt` is always replaced with the settings shown in the tool – use
+      **Read from camera** first to start from the settings already on the card.
       The last used settings (passwords included, in plain text) are remembered in
       `LamaxTool_settings.txt` next to the program – or in `%APPDATA%\LamaxTool\` /
       `~/.config/lamaxtool/` if the program's folder is read-only. Delete it to start from the defaults.
 4. Reboot the camera from its charger / power supply. After ~10 s the status page appears.
+   The camera switches itself on when external power is connected, so after a power cut
+   it starts streaming again by itself; a switchable plug can be used to turn it on remotely.
 5. Add `rtsp://<camera ip>:554/stream` to your NVR as a *generic RTSP* channel
-   (prefer **TCP** transport if the NVR offers it).
+   (prefer **TCP** transport if the NVR offers it). With the camera on USB,
+   **🔗 Get stream link from camera** on the RTSP tab shows the exact address (current IP,
+   port, path, and user name / password if set) with a **📋 Copy** button.
 
 Manual installation without the tool: [docs/INSTALL.md](docs/INSTALL.md).
 
@@ -69,7 +80,9 @@ Manual installation without the tool: [docs/INSTALL.md](docs/INSTALL.md).
 **Scan WiFi w. camera** uses the camera's own radio, so it needs a camera that already
 runs this software (boot hook installed, SD card written, camera restarted) and is
 connected over USB. The list shows each network's signal in dBm – the most accurate
-picture of what the camera will see where it is. For the very first setup simply type
+picture of what the camera will see where it is. The networks the camera already knows
+appear at once; three fresh scans (about 3 s each – a single scan catches only part of
+the networks) are added to the list as they finish. For the very first setup simply type
 the network name.
 
 ## Security notes
@@ -93,30 +106,33 @@ Windows line endings are fine). The file is self-documenting; the main keys:
 | `CAMERA_NAME` | `camera1` | shown on screen and in the stream description |
 | `WIFI_SSID`, `WIFI_PASSWORD` | | 2.4 GHz network; empty password = open network |
 | `IP_MODE` | `dhcp` | `static` uses `IP_ADDRESS`, `IP_NETMASK`, `IP_GATEWAY`, `IP_DNS` |
-| `VIDEO_WIDTH`/`HEIGHT`/`FPS`/`BITRATE_KBPS` | 1920/1080/25/4000 | |
+| `VIDEO_WIDTH`/`HEIGHT`/`FPS`/`BITRATE_KBPS` | 1920/1080/15/3000 | 15 fps is plenty for surveillance; 3000 kbit/s ≈ 32 GB a day. 2688×1520: use 15–20 fps, about 5000–6000 kbit/s. The tool's 💡 button shows the suggested bitrate for the chosen resolution and fps |
 | `VIDEO_GOP_SECONDS`, `VIDEO_PROFILE`, `VIDEO_FLIP` | 2 / main / 0 | flip = rotate 180° |
 | `RTSP_PORT`, `RTSP_PATH`, `RTSP_USER`, `RTSP_PASSWORD` | 554 / stream | |
 | `OSD_TIME`, `OSD_POSITION`, `OSD_NAME` | 1 / top-left / 0 | date and time in the picture, corner, camera name in front of it |
+| `OSD_BATTERY` | 1 | `BAT 87%` after the time while running from the battery (nothing on external power) |
 | `TIMEZONE` | `CET-1CEST,M3.5.0,M10.5.0/3` | POSIX TZ string (examples in `config.txt`; LamaxTool has a list) |
 | `NTP_SERVER` | `pool.ntp.org` | time server; the WiFi router is tried as well. Synced after WiFi connects, then every 6 h |
 | `SCREEN_TIMEOUT` | 60 | seconds; 0 = always on |
 | `LED` | `on` | `off` = status LEDs off |
-| `BATTERY_LONG_LIFE` | 1 | charge only to 4.10 V (≈ 85–90 %) to spare an always-powered battery; 0 = full charge |
+| `BATTERY_LONG_LIFE` | 1 | charge only to 4.10 V (≈ 85–90 %) and, on battery, power off at 10 % / 3.45 V (it starts again when external power returns); 0 = full charge, run until empty |
 | `WATCHDOG` | 1 | reboot if the stream program hangs |
-| `LOG` | `sd` | `sd` = `cam/log.txt` (max 2 × 512 KB, rotated while running), `ram` = RAM only, nothing written to the card, `off` |
+| `LOG` | `off` | `sd` = `cam/log.txt` (max 2 × 512 KB, rotated while running), `ram` = RAM only, nothing written to the card, `off` |
 | `WIFI_DEBUG_LOG` | 0 | verbose `cam/wpa_log.txt` (max 2 × 1 MB) |
 
 ## Screen and buttons
 
 * **Status page:** network name, signal strength in dBm with bars and a rating
   (Excellent ≥ −55, Good ≥ −65, Fair ≥ −72, Weak ≥ −80 dBm), IP address and mode,
-  RTSP port/path, number of clients and bitrate, CPU and RAM usage, the temperature
+  RTSP port/path and resolution (e.g. `1080p`), number of clients and bitrate, CPU and RAM usage, the temperature
   inside the camera (power-management chip, orange from 70 °C, red from 80 °C), the uptime
   in the bottom right corner, and in the header the battery voltage, icon and percentage
-  (▲ = charging, yellow **LIM** = long-life charge limit of 4.10 V reached; with long-life
+  (▲ = charging, yellow **LIM** = long-life limit reached: on external power, charging has stopped and the battery waits at about 4.05 V; with long-life
   charging a white tick in the icon marks the limit) or **DC** when there is no battery.
-  The percentage comes from the charger chip's own fuel gauge, which calls the 4.10 V
-  limit "99–100 %"; the real state of charge there is about 85–90 %.
+  The percentage is the charger chip's own estimate (not the real charge): when long-life
+  charging stops at 4.10 V it jumps to 100 % ("Full"), after a restart it re-estimates from the
+  voltage and shows about 86–90 % for the same battery. Either way the real state of charge
+  there is about 85–90 %.
   About −67 dBm or better is needed for a stable 1080p stream.
 * **Any button except power:** WiFi scan page (networks by signal strength, your
   network highlighted, rescans about every 20 s; a network stays listed for 35 s after it was last seen, because the
@@ -145,7 +161,7 @@ cam/autorun.sh      started by the boot hook; starts and supervises everything
 cam/config.txt      settings
 cam/bin/            camd (stream), camui (screen), camled (LEDs), camnet (network helper),
                     wpa_supplicant + wpa_cli
-cam/log.txt         log (LOG=sd; rotated at 512 KB while running, previous part in log.txt.old)
+cam/log.txt         log, only with LOG=sd (rotated at 512 KB while running, previous part in log.txt.old)
 cam/wifi_scan.txt   last WiFi scan
 ```
 
@@ -153,7 +169,7 @@ cam/wifi_scan.txt   last WiFi scan
 
 * **Logo stays on screen / nothing happens:** the card has no `cam/autorun.sh`, or
   the card is exFAT – the camera only reads **FAT32** (format it in the camera's
-  own menu). Look at `cam/log.txt`.
+  own menu). Set `LOG=sd` and look at `cam/log.txt`.
 * **No WiFi:** only 2.4 GHz is supported; WPA3-only networks do not work (WPA2/WPA3
   mixed mode does). Set `WIFI_DEBUG_LOG=1` and check `cam/wpa_log.txt`.
 * **Back to stock:** set `MODE=stock`, remove the `cam` folder, or restore the boot

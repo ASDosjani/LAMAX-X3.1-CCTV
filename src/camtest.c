@@ -38,7 +38,8 @@ int main(int argc, char **argv)
     if (cap_start(&cap) < 0) return 1;
 
     h264enc_cfg_t ec = { .width = cap.width, .height = cap.height, .stride = cap.bytesperline,
-                         .fps = fps, .bitrate = kbit * 1000, .gop = fps * 2, .profile = 77, .level = 40 };
+                         .fps = fps, .bitrate = kbit * 1000, .gop = fps * 2, .profile = 77,
+                         .level = cap.width * cap.height > 1920 * 1088 ? 50 : 40 };
     h264enc_t *enc = h264enc_open(&ec);
     if (!enc) return 1;
 

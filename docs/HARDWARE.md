@@ -31,6 +31,12 @@ page 2048, ~28 KB free). `script.bin` (board config) lives in `uboot` at offset 
   3264×2448 … 1280×720. **The frame rate passed to `VIDIOC_S_PARM` selects the sensor
   mode**: 30 fps gives the normal 1080p/720p modes, 25 fps picked a 720p high-speed
   mode. camd always captures at 30 fps and drops frames.
+* Sizes the driver lists: 3264×2448, 3264×1836, 3200×1800, 2688×1520, 1920×1088, 1920×1080,
+  1632×1224, 1632×918, 1280×720. It picks the largest one that fits the requested size and
+  the frame rate's mode, so 2560×1440 gives 1920×1088. Measured with `camtest`:
+  2688×1520 at 30 fps (≈27 ms per frame to encode, H.264 level 5.0), 3264×1836 at 15 fps only
+  (≈39 ms), 1632×1224 at 15–20 fps, 1280×720 at up to ≈90 fps when 20 fps is requested.
+  The full 3264×2448 crashed the camera (not enough memory).
 * With 1080 lines the UV plane starts after **1088** luma rows (16-aligned).
 * The H.264 encoder is the camera's `libvencoder.so` (CedarX). Its parameter indices
   are 4 higher than in the public `vencoder.h` from 2015: `H264Param = 22`,
@@ -38,6 +44,8 @@ page 2048, ~28 KB free). `script.bin` (board config) lives in `uboot` at offset 
 * `/dev/video0` is held by `mediaserver` while the stock software runs: stop `sdv` and `media`.
 * The time stamp is drawn into the encoder's own copy of each frame (luma 235 text,
   16 outline, chroma 128 under it), from a mask rendered once per second; the stream keeps 25 fps.
+  The 8×16 font is scaled to about 3.2 % of the frame height in half steps:
+  48 px at 1520p (3×), 32 px at 1080p (2×), 24 px at 720p (1.5×).
 
 ## Clock
 
@@ -80,11 +88,21 @@ cannot be held off. The charge end voltage sticks: `battery/chgmicrovol` = 41000
 gives register 0x33 = 0x90 (4.10 V, ≈ 85–90 %); the stock value is 4200000 (0xD0).
 The AXP209 offers 4.10 / 4.15 / 4.20 / 4.36 V only – there is no percentage limit.
 
+**Power-off voltage:** the AXP209 cuts the power at VOFF, register 0x31 bits 2–0
+(2.6 V + n × 0.1 V); stock 0x03 = 2.9 V. With `BATTERY_LONG_LIFE=1` autorun.sh sets 3.1 V
+as a backstop, and camui powers off cleanly (`reboot -p`) at 10 % or below 3.45 V for 30 s.
+On external power with long-life charging the cell idles at ~4.05 V: charging stops at
+4.10 V and only restarts after the voltage has dropped (status *Not charging*, 0 mA).
+
+**Power-on:** the camera switches itself on when external (USB) power is connected
+(tested), so it restarts by itself after a power cut. There is no wake-on-WLAN: when it
+is off, the WiFi chip has no power.
+
 **AXP209 registers** can be read through the driver's own sysfs files in
 `/sys/bus/i2c/devices/0-0034/`: write a register number below 0x100 (hex) to
 `axp20_reg` or `axp20_regs`, then read it back (`REG[33]=d0` /
-`REG[0x5e]=0x7e,REG[0x5f]=0x4`). Writing a 16-bit value `RRVV` writes VV to register
-RR – be careful. (`/sys/class/axppower/regdebug` only stores a number, it reads nothing.)
+`REG[0x5e]=0x7e,REG[0x5f]=0x4`). Writing a 16-bit value `RRVV` to **`axp20_reg`** writes
+VV to register RR – be careful (the same write to `axp20_regs` does nothing). (`/sys/class/axppower/regdebug` only stores a number, it reads nothing.)
 
 ## Temperature
 

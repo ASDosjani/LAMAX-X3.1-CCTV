@@ -1,7 +1,12 @@
 # --- build output -----------------------------------------------------------
 out/
 build/
-dist/
+# dist/ is ignored except the two LamaxTool builds, which are committed so a fresh
+# clone can be used without building. dist/ also holds backups/, platform-tools/ and
+# LamaxTool_settings.txt (passwords) when the tool is run from there: never commit those.
+dist/*
+!dist/LamaxTool.exe
+!dist/LamaxTool
 *.spec
 __pycache__/
 *.pyc

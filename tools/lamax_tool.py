@@ -1,4 +1,4 @@
-"""LAMAX X3.1 camera tool (GUI for Windows and Linux).
+"""LAMAX X3.1 camera tool (GUI for Windows, Linux and macOS).
 
 Per camera, over USB/adb:
   1. Back up the whole NOR flash (all 8 MTD partitions, each read twice and compared)
@@ -7,7 +7,8 @@ Per camera, over USB/adb:
   4. Write the SD card files (programs + config.txt) to the camera or to a drive / folder
 The WiFi name can be picked from the networks the camera itself sees (once our software runs on it).
 Run from source:  python tools/lamax_tool.py   (Linux: python3, needs python3-tk and adb)
-Build: tools/build_exe.ps1 (Windows exe), tools/build_linux.sh (Linux binary)
+Build: tools/build_exe.ps1 (Windows exe), tools/build_linux.sh (Linux binary),
+       tools/build_macos.sh (macOS app)
 """
 import datetime, hashlib, io, os, queue, re, shutil, subprocess, sys, tempfile, threading, urllib.request, zipfile
 import tkinter as tk
@@ -17,6 +18,11 @@ APP = 'LAMAX X3.1 camera tool'
 # resource dir (PyInstaller unpacks data here) and the folder next to the exe / repo root
 RES = getattr(sys, '_MEIPASS', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 HOME = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else RES
+if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
+    # A macOS app runs from inside LamaxTool.app (read-only, possibly a randomised copy when
+    # started from Downloads), so backups, adb and the settings go to ~/LamaxTool instead.
+    HOME = os.path.join(os.path.expanduser('~'), 'LamaxTool')
+    os.makedirs(HOME, exist_ok=True)
 sys.path.insert(0, os.path.join(RES, 'boot'))
 import make_boot  # noqa: E402
 
@@ -232,7 +238,7 @@ SETTINGS = [
     ('Network', 'IP_NETMASK', 'Netmask', 'ip', None),
     ('Network', 'IP_GATEWAY', 'Gateway', 'ip', None),
     ('Network', 'IP_DNS', 'DNS', 'ip', None),
-    ('Video', 'RESOLUTION', 'Resolution', 'choice', ['1920x1080', '1280x720']),
+    ('Video', 'RESOLUTION', 'Resolution', 'choice', ['2688x1520', '1920x1080', '1280x720']),
     ('Video', 'VIDEO_FPS', 'Frames per second', 'int', (1, 30)),
     ('Video', 'VIDEO_BITRATE_KBPS', 'Bitrate (kbit/s)', 'int', (200, 12000)),
     ('Video', 'VIDEO_GOP_SECONDS', 'Key frame every (s)', 'int', (1, 10)),
@@ -240,6 +246,7 @@ SETTINGS = [
     ('Video', 'VIDEO_FLIP', 'Rotate picture 180°', 'bool', ('1', '0')),
     ('Time', 'OSD_TIME', 'Date and time in the picture', 'bool', ('1', '0')),
     ('Time', 'OSD_NAME', 'Camera name before the time', 'bool', ('1', '0')),
+    ('Time', 'OSD_BATTERY', 'Battery % when not on external power', 'bool', ('1', '0')),
     ('Time', 'OSD_POSITION', 'Position', 'choice', ['top-left', 'top-right', 'bottom-left', 'bottom-right']),
     ('Time', 'NTP_SERVER', 'Time server (NTP)', 'text', None),
     ('Time', 'TIMEZONE', 'Time zone', 'tz', None),
@@ -251,7 +258,7 @@ SETTINGS = [
     ('Device', 'MODE', 'Mode', 'choice', ['camera', 'stock']),
     ('Device', 'SCREEN_TIMEOUT', 'Screen off after (s, 0 = never)', 'int', (0, 3600)),
     ('Device', 'LED', 'Status LEDs', 'bool', ('on', 'off')),
-    ('Device', 'BATTERY_LONG_LIFE', 'Battery long life (charge to ~85-90 %)', 'bool', ('1', '0')),
+    ('Device', 'BATTERY_LONG_LIFE', 'Battery long life (charge to ~85-90 %, off at 10 %)', 'bool', ('1', '0')),
     ('Device', 'WATCHDOG', 'Reboot if the stream hangs', 'bool', ('1', '0')),
     ('Device', 'LOG', 'Log (sd / ram = not on the card / off)', 'choice', ['sd', 'ram', 'off']),
     ('Device', 'WIFI_DEBUG_LOG', 'Detailed WiFi log (on the card)', 'bool', ('1', '0')),
@@ -272,11 +279,11 @@ TZ_LABEL = {tz: '%s  [%s]' % (name, tz) for name, tz in TIMEZONES}
 
 FALLBACK_DEFAULTS = {'CAMERA_NAME': 'camera1', 'IP_MODE': 'dhcp', 'IP_ADDRESS': '192.168.1.50',
                      'IP_NETMASK': '255.255.255.0', 'IP_GATEWAY': '192.168.1.1', 'IP_DNS': '192.168.1.1',
-                     'VIDEO_WIDTH': '1920', 'VIDEO_HEIGHT': '1080', 'VIDEO_FPS': '25',
-                     'VIDEO_BITRATE_KBPS': '4000', 'VIDEO_GOP_SECONDS': '2', 'VIDEO_PROFILE': 'main',
+                     'VIDEO_WIDTH': '1920', 'VIDEO_HEIGHT': '1080', 'VIDEO_FPS': '15',
+                     'VIDEO_BITRATE_KBPS': '3000', 'VIDEO_GOP_SECONDS': '2', 'VIDEO_PROFILE': 'main',
                      'VIDEO_FLIP': '0', 'RTSP_PORT': '554', 'RTSP_PATH': 'stream', 'RTSP_MAX_CLIENTS': '4',
                      'MODE': 'camera', 'SCREEN_TIMEOUT': '60', 'LED': 'on', 'BATTERY_LONG_LIFE': '1',
-                     'WATCHDOG': '1', 'WIFI_DEBUG_LOG': '0', 'LOG': 'sd', 'OSD_TIME': '1', 'OSD_NAME': '0',
+                     'WATCHDOG': '1', 'WIFI_DEBUG_LOG': '0', 'LOG': 'off', 'OSD_TIME': '1', 'OSD_NAME': '0', 'OSD_BATTERY': '1',
                      'OSD_POSITION': 'top-left', 'TIMEZONE': 'CET-1CEST,M3.5.0,M10.5.0/3', 'NTP_SERVER': 'pool.ntp.org'}
 
 
@@ -294,6 +301,22 @@ def parse_config(text):
             v = v[1:-1]
         out[k] = v
     return out
+
+
+# Suggested H.264 bitrate (main profile) at 15 fps; more fps cost less than
+# proportionally (P-frames are small): x (fps/15)^0.6. 1080p: 15 -> 3000, 30 -> 4500.
+BITRATE_AT_15FPS = {'2688x1520': 5000, '1920x1080': 3000, '1280x720': 1500}
+
+
+def suggested_bitrate(resolution, fps):
+    try:
+        fps = max(1, min(30, int(fps)))
+    except (TypeError, ValueError):
+        return None
+    base = BITRATE_AT_15FPS.get(resolution)
+    if base is None:
+        return None
+    return int(round(base * (fps / 15.0) ** 0.6 / 100.0)) * 100
 
 
 def default_values():
@@ -416,7 +439,7 @@ def sd_files():
     return files
 
 
-def write_sd_adb(adb, config_text, overwrite_config, log):
+def write_sd_adb(adb, config_text, log):
     mounts = adb.sh('cat /proc/mounts')
     if ' /mnt/extsd ' not in mounts:
         raise RuntimeError('The SD card is not mounted on the camera. If the camera shows the USB mode '
@@ -425,34 +448,26 @@ def write_sd_adb(adb, config_text, overwrite_config, log):
     for rel, src in sd_files():
         adb.push(src, '/mnt/extsd/cam/' + rel)
         log('  cam/' + rel)
-    exists = 'yes' in adb.sh('[ -f /mnt/extsd/cam/config.txt ] && echo yes || echo no')
-    if exists and not overwrite_config:
-        log('  cam/config.txt exists - kept')
-    else:
-        tmp = tempfile.mkdtemp()
-        try:
-            p = os.path.join(tmp, 'config.txt')
-            open(p, 'w', encoding='utf-8', newline='').write(config_text)
-            adb.push(p, '/mnt/extsd/cam/config.txt')
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-        log('  cam/config.txt written')
+    tmp = tempfile.mkdtemp()                # config.txt always reflects the form
+    try:
+        p = os.path.join(tmp, 'config.txt')
+        open(p, 'w', encoding='utf-8', newline='').write(config_text)
+        adb.push(p, '/mnt/extsd/cam/config.txt')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    log('  cam/config.txt written')
     adb.sh('sync')
     log('SD card ready.')
 
 
-def write_sd_folder(root, config_text, overwrite_config, log):
+def write_sd_folder(root, config_text, log):
     dst = os.path.join(root, 'cam')
     os.makedirs(os.path.join(dst, 'bin'), exist_ok=True)
     for rel, src in sd_files():
         shutil.copyfile(src, os.path.join(dst, rel.replace('/', os.sep)))
         log('  cam/' + rel)
-    cfg = os.path.join(dst, 'config.txt')
-    if os.path.exists(cfg) and not overwrite_config:
-        log('  cam/config.txt exists - kept')
-    else:
-        open(cfg, 'w', encoding='utf-8', newline='').write(config_text)
-        log('  cam/config.txt written')
+    open(os.path.join(dst, 'config.txt'), 'w', encoding='utf-8', newline='').write(config_text)
+    log('  cam/config.txt written')
     log('Files copied to %s - eject the drive safely before removing the card.' % dst)
 
 
@@ -474,27 +489,61 @@ def _band_from_mhz(mhz):
     return '2.4' if mhz < 3000 else '5' if mhz < 5925 else '6'
 
 
-def scan_wifi_camera(adb):
+SCAN_ROUNDS = 3        # one scan takes 1-3 s on the camera but catches only part of the networks
+
+
+def scan_wifi_camera(adb, on_update=None):
     """Networks the camera's own radio sees (needs our software running on it),
-    one entry per name with the strongest signal, strongest first."""
+    one entry per name with the strongest signal, strongest first.
+    First the camera's cached results (instant), then SCAN_ROUNDS fresh scans merged;
+    on_update(nets, final) is called after each step."""
     w = '/dev/cam/wpa_cli -p /dev/cam/wpa'
     if 'yes' not in adb.sh('[ -S /dev/cam/wpa/wlan0 ] && echo yes || echo no', timeout=10):
         raise RuntimeError('The camera is not running the security camera software yet.\n'
                            'Install the boot hook, write the SD card, restart the camera and connect it '
                            'over USB again - or type the network name.')
-    out = adb.sh('%s scan >/dev/null; sleep 8; %s scan_results' % (w, w), timeout=30)
-    nets = []
-    for line in out.splitlines():
-        f = line.split('\t')
-        if len(f) >= 4 and re.match(r'^[0-9a-f:]{17}$', f[0]):
-            dbm = int(f[2])
-            nets.append(dict(ssid=f[4] if len(f) > 4 else '', signal=max(0, min(100, 2 * (dbm + 100))),
-                             band=_band_from_mhz(int(f[1])), dbm=dbm))
     best = {}
-    for n in nets:
-        if n['ssid'] and (n['ssid'] not in best or n['signal'] > best[n['ssid']]['signal']):
-            best[n['ssid']] = n
-    return sorted(best.values(), key=lambda n: -n['signal'])
+
+    def merge(out):
+        for line in out.splitlines():
+            f = line.split('\t')
+            if len(f) >= 5 and re.match(r'^[0-9a-f:]{17}$', f[0]) and f[4]:
+                dbm = int(f[2])
+                n = dict(ssid=f[4], signal=max(0, min(100, 2 * (dbm + 100))),
+                         band=_band_from_mhz(int(f[1])), dbm=dbm)
+                if n['ssid'] not in best or n['signal'] > best[n['ssid']]['signal']:
+                    best[n['ssid']] = n
+        return sorted(best.values(), key=lambda n: -n['signal'])
+
+    nets = merge(adb.sh('%s scan_results' % w, timeout=15))
+    for i in range(SCAN_ROUNDS):
+        if on_update:
+            on_update(nets, False)
+        nets = merge(adb.sh('%s scan >/dev/null; sleep 3; %s scan_results' % (w, w), timeout=20))
+    if on_update:
+        on_update(nets, True)
+    return nets
+
+
+def rtsp_link(adb):
+    """rtsp:// address of the running stream: live IP, port/path of the running
+    server, user name and password from the camera's own config.txt."""
+    out = adb.sh('/dev/cam/camnet show wlan0; echo; cat /dev/cam/camd.status; echo; '
+                 'cat /mnt/extsd/cam/config.txt', timeout=15)
+    m = re.search(r'wlan0:\s+(\d+\.\d+\.\d+\.\d+)', out)
+    if not m:
+        raise RuntimeError('The camera has no IP address yet (WiFi not connected?).')
+    ip = m.group(1)
+    st = dict(re.findall(r'\b(port|path)=(\S+)', out))
+    cfg = parse_config(out)
+    port = st.get('port') or cfg.get('RTSP_PORT') or '554'
+    path = st.get('path') or cfg.get('RTSP_PATH') or 'stream'
+    user, pw = cfg.get('RTSP_USER', ''), cfg.get('RTSP_PASSWORD', '')
+    from urllib.parse import quote
+    login = ''
+    if user:
+        login = quote(user, safe='') + (':' + quote(pw, safe='') if pw else '') + '@'
+    return 'rtsp://%s%s%s/%s' % (login, ip, '' if port == '554' else ':' + port, path.lstrip('/'))
 
 
 # ----------------------------------------------------------------------------- GUI
@@ -566,6 +615,8 @@ class App(tk.Tk):
             if tab not in tabs:
                 tabs[tab] = ttk.Frame(nb, padding=6); nb.add(tabs[tab], text=TAB_ICONS.get(tab, '') + tab); counts[tab] = 0
             f, i = tabs[tab], counts[tab]; counts[tab] += 1
+            if kind == 'tz':                   # wide field: a row of its own
+                i += i % 2; counts[tab] = i + 2
             r, c = i // 2, (i % 2) * 2
             if kind == 'bool':
                 v = tk.BooleanVar(); self.cfg[key] = v
@@ -585,10 +636,25 @@ class App(tk.Tk):
             elif kind == 'tz':                 # pick a common zone or type any POSIX TZ string
                 ttk.Combobox(f, textvariable=v, values=[TZ_LABEL[tz] for _, tz in TIMEZONES], width=60).grid(
                     row=r, column=c + 1, columnspan=3, sticky='w', padx=4, pady=2)
+            elif key == 'VIDEO_BITRATE_KBPS':  # spinbox + "use the suggested value" button
+                fr = ttk.Frame(f); fr.grid(**cell)
+                ttk.Spinbox(fr, textvariable=v, from_=extra[0], to=extra[1], increment=100, width=8).pack(side='left')
+                self.br_hint = tk.StringVar()
+                self.br_btn = button(fr, '', self.use_suggested_bitrate, padx=(3, 0))
+                self.br_btn.configure(textvariable=self.br_hint)
             elif kind == 'int':
                 ttk.Spinbox(f, textvariable=v, from_=extra[0], to=extra[1], width=24).grid(**cell)
             else:
                 ttk.Entry(f, textvariable=v, width=26, show='*' if kind == 'password' else '').grid(**cell)
+        # RTSP tab: the running camera's stream address, ready to copy (VLC, NVR ...)
+        lf = ttk.Frame(tabs['RTSP']); lf.grid(row=50, column=0, columnspan=4, sticky='we', padx=4, pady=(8, 2))
+        button(lf, '🔗 Get stream link from camera', self.do_rtsp_link)
+        self.rtsp_link = tk.StringVar()
+        ttk.Entry(lf, textvariable=self.rtsp_link, state='readonly', width=48).pack(side='left', padx=4)
+        button(lf, '📋 Copy', self.copy_rtsp_link)
+        self._br_suggest = None
+        for k in ('RESOLUTION', 'VIDEO_FPS'):
+            self.cfg[k].trace_add('write', lambda *_: self.on_video_change())
         ttk.Label(sd, text='The last used settings are remembered in LamaxTool_settings.txt next to the program (passwords included).',
                   style='Hint.TLabel').pack(anchor='w')
         last = load_last_settings()
@@ -603,8 +669,6 @@ class App(tk.Tk):
                             padding=(6, 6)); wr.pack(fill='x', **pad)
         button(wr, '⬆  Write to camera SD card (USB)', self.do_sd_adb, style='Big.TButton', padx=(0, 6))
         button(wr, '🖴  Write to drive / folder...', self.do_sd_folder, style='Big.TButton', padx=(0, 6))
-        self.overwrite = tk.BooleanVar(value=False)
-        ttk.Checkbutton(wr, text='Overwrite existing config.txt', variable=self.overwrite).pack(side='left', padx=8)
         self.protocol('WM_DELETE_WINDOW', self.on_close)
 
         logf = ttk.LabelFrame(self, text=' 📝 Log ', style='Section.TLabelframe'); logf.pack(fill='both', expand=True, **pad)
@@ -664,6 +728,23 @@ class App(tk.Tk):
                 self.q.put(lambda: self.set_busy(False))
                 self.q.put(self.refresh)
         threading.Thread(target=worker, daemon=True).start()
+
+    def on_video_change(self):
+        """Resolution or fps changed: update the suggestion; a bitrate that was
+        the previous suggestion follows it (a hand-set value is kept)."""
+        new = suggested_bitrate(self.cfg['RESOLUTION'].get(), self.cfg['VIDEO_FPS'].get())
+        if new is None:
+            self.br_hint.set('💡 suggested: ?')
+            return
+        br = self.cfg['VIDEO_BITRATE_KBPS']
+        if self._br_suggest is not None and br.get().strip() == str(self._br_suggest):
+            br.set(str(new))
+        self._br_suggest = new
+        self.br_hint.set('💡 suggested: %d' % new)
+
+    def use_suggested_bitrate(self):
+        if self._br_suggest is not None:
+            self.cfg['VIDEO_BITRATE_KBPS'].set(str(self._br_suggest))
 
     def set_values(self, values):
         """Fill the form from a KEY -> value dict (missing keys: defaults)."""
@@ -824,27 +905,48 @@ class App(tk.Tk):
             subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', BACKUPS])
 
     def do_wifi_scan(self):
-        def task(adb):
-            nets = scan_wifi_camera(adb)
+        shown = [False]
+
+        def update(nets, final):
             items, mapping = [], {}
             for n in nets:
                 note = '' if n['band'] in ('2.4', '?') else '   (%s GHz - not usable)' % n['band']
-                sig = '%d dBm' % n['dbm'] if 'dbm' in n else '%d%%' % n['signal']
-                text = '%s   %s%s' % (n['ssid'], sig, note)
+                text = '%s   %d dBm%s' % (n['ssid'], n['dbm'], note)
                 items.append(text)
                 mapping[text] = n['ssid']
-            self.log('%d networks seen by the camera (2.4 GHz only):' % len(nets))
-            for t in items:
-                self.log('  ' + t)
+            if final:
+                self.log('%d networks seen by the camera (2.4 GHz only):' % len(nets))
+                for t in items:
+                    self.log('  ' + t)
 
             def show():
                 self.ssid_map = mapping
                 self.ssid_box['values'] = items
-                if items:
+                self.status.set('' if final else 'Scanning WiFi... %d networks so far' % len(items))
+                try:        # refresh an open drop-down list in place
+                    self.ssid_box.tk.call('ttk::combobox::ConfigureListbox', str(self.ssid_box))
+                except tk.TclError:
+                    pass
+                if items and not shown[0]:
+                    shown[0] = True
                     self.ssid_box.focus_set()
                     self.ssid_box.event_generate('<Down>')     # drop the list down
             self.q.put(show)
-        self.run_task('Scan WiFi with the camera', task)
+        self.run_task('Scan WiFi with the camera', lambda adb: scan_wifi_camera(adb, update))
+
+    def do_rtsp_link(self):
+        def task(adb):
+            link = rtsp_link(adb)
+            self.log('Stream: %s' % re.sub(r'(//[^:@/]+:)[^@]+@', r'\1***@', link))   # no password in the log
+            self.q.put(lambda: self.rtsp_link.set(link))
+        self.run_task('Get the stream link from the camera', task)
+
+    def copy_rtsp_link(self):
+        link = self.rtsp_link.get()
+        if link:
+            self.clipboard_clear()
+            self.clipboard_append(link)
+            self.status.set('Stream link copied to the clipboard')
 
     def on_ssid_selected(self, _event=None):
         text = self.ssid_box.get()
@@ -855,8 +957,7 @@ class App(tk.Tk):
             text = make_config(self.config_values())
         except Exception as e:
             messagebox.showerror(APP, str(e)); return
-        ow = self.overwrite.get()
-        self.run_task('Write SD card over adb', lambda adb: write_sd_adb(adb, text, ow, self.log))
+        self.run_task('Write SD card over adb', lambda adb: write_sd_adb(adb, text, self.log))
 
     def do_sd_folder(self):
         try:
@@ -866,7 +967,7 @@ class App(tk.Tk):
         root = filedialog.askdirectory(title='Select the SD card drive (its root folder)')
         if root:
             self.run_task('Write SD card to %s' % root,
-                          lambda _, ow=self.overwrite.get(): write_sd_folder(root, text, ow, self.log), need_device=False)
+                          lambda _: write_sd_folder(root, text, self.log), need_device=False)
 
 
 if __name__ == '__main__':

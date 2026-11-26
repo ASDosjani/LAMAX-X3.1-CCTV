@@ -289,9 +289,27 @@ static int read_int_file(const char *p, int def)
     return v;
 }
 
+/* BATTERY_LONG_LIFE: switch off before the cell is deeply discharged (the charger
+ * chip itself only cuts off at 2.9 V). Low = on battery and at most LOW_PCT or below
+ * LOW_UV; it has to stay low for LOW_SECS so a short load peak does not count. */
+#ifndef LOW_PCT                     /* overridable for testing: -DLOW_PCT=95 */
+#define LOW_PCT  10
+#endif
+#define LOW_UV   3450000
+#define LOW_SECS 30
+static int battery_low(void)
+{
+    if (read_int_file("/sys/class/power_supply/battery/present", 1) == 0) return 0;
+    if (read_int_file("/sys/class/power_supply/usb/online", 0) || read_int_file("/sys/class/power_supply/ac/online", 0))
+        return 0;
+    int pct = read_int_file("/sys/class/power_supply/battery/capacity", -1);
+    int uv = read_int_file("/sys/class/power_supply/battery/voltage_now", 0);
+    return (pct >= 0 && pct <= LOW_PCT) || (uv > 0 && uv < LOW_UV);
+}
+
 /* Battery voltage, icon and percent at the right edge of the header:
  *   "4.11V [###  ] 99%▲"   charging
- *   "4.11V [####|] 99%LIM" long-life limit (4.10 V) reached on external power
+ *   "4.05V [####|] 86%LIM" long-life limit reached: on external power, charging stopped
  * With BATTERY_LONG_LIFE=1 a white tick in the icon marks where charging stops.
  * Colours: cyan on external power; on battery green / yellow / red by level. */
 static void draw_battery(fb_t *fb, int long_life)
@@ -319,8 +337,10 @@ static void draw_battery(fb_t *fb, int long_life)
     int ext = read_int_file("/sys/class/power_supply/usb/online", 0) || read_int_file("/sys/class/power_supply/ac/online", 0);
     uint32_t c = (charging || ext) ? RGB(80, 220, 255) : pct > 50 ? C_GREEN : pct > 20 ? C_YELLOW : C_RED;
     int uv = read_int_file("/sys/class/power_supply/battery/voltage_now", 0);
-    /* the charger holds the cell at 4.10 V in long-life mode; from ~4.08 V on it is at the limit */
-    int at_limit = long_life && ext && uv >= 4080000;
+    /* long-life mode on external power and not charging: charging stopped at 4.10 V and the
+     * charger only restarts it once the cell has dropped well below that (it then sits at
+     * ~4.05 V, running from external power) - that is the limit, not a fault */
+    int at_limit = long_life && ext && !charging;
 
     char txt[16];
     snprintf(txt, sizeof(txt), "%d%%%s", pct,
@@ -425,7 +445,11 @@ static void draw_status(fb_t *fb, const config_t *cfg, wpactrl_t *w)
         const char *p;
         #define FIELD(name, dst) do { dst[0] = 0; if ((p = strstr(cs, name "="))) sscanf(p + strlen(name) + 1, "%15s", dst); } while (0)
         FIELD("port", port); FIELD("path", path); FIELD("clients", clients); FIELD("kbps", kbps); FIELD("res", res);
-        snprintf(line, sizeof(line), "RTSP :%s/%s", port, path);
+        const char *x = strchr(res, 'x');             /* "1920x1080" -> "1080p" */
+        int lines = x ? atoi(x + 1) : 0;
+        if (lines == 1088) lines = 1080;
+        if (lines > 0) snprintf(line, sizeof(line), "RTSP :%s/%s %dp", port, path, lines);
+        else snprintf(line, sizeof(line), "RTSP :%s/%s", port, path);
         fb_text(fb, 4, y, line, C_WHITE, 1); y += 16;
         snprintf(line, sizeof(line), "%s client(s) %.1f Mb/s", clients, atof(kbps) / 1000);
         fb_text(fb, 4, y, line, atoi(clients) ? C_GREEN : C_GRAY, 1); y += 16;
@@ -497,6 +521,7 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_sig);
     signal(SIGINT, on_sig);
     int timeout = config_int(cfg, "SCREEN_TIMEOUT", 60);
+    int long_life = config_int(cfg, "BATTERY_LONG_LIFE", 1);
 
     fb_t fb;
     if (fb_open(&fb, "/dev/graphics/fb0") < 0) return 1;
@@ -516,6 +541,7 @@ int main(int argc, char **argv)
     net_t nets[MAX_NETS];
     int nnets = 0, page = PAGE_STATUS, scanning = 0;
     double last_activity = now_s(), last_draw = 0, scan_started = 0, last_scan = 0, power_down = 0;
+    double last_bat = 0, low_since = 0;
 
     while (!g_stop) {
         double t = now_s();
@@ -551,6 +577,24 @@ int main(int argc, char **argv)
                 }
                 if (page == PAGE_STATUS) { page = PAGE_SCAN; last_scan = 0; }   /* keep the last list while scanning */
                 else { page = PAGE_STATUS; scanning = 0; }
+            }
+        }
+        if (long_life && t - last_bat >= 1) {              /* early shutdown on a low battery */
+            last_bat = t;
+            if (!battery_low()) low_since = 0;
+            else if (!low_since) {
+                low_since = t;
+                LOGI("battery low (%d%%, %d mV): powering off in %d s unless power returns",
+                     read_int_file("/sys/class/power_supply/battery/capacity", -1),
+                     read_int_file("/sys/class/power_supply/battery/voltage_now", 0) / 1000, LOW_SECS);
+            } else if (t - low_since >= LOW_SECS) {
+                fb_blank(&fb, 0);
+                draw_message(&fb, "Battery low", "Powering off...");
+                LOGI("battery low: power off");
+                sleep(5);
+                sync();
+                system("/system/bin/reboot -p");
+                sleep(10);
             }
         }
         if (power_down && t - power_down >= 3) {           /* hold power 3 s: shut down */

@@ -17,6 +17,7 @@ Building on a plain Linux machine works the same way – skip the WSL part and r
 | `wpa_supplicant`, `wpa_cli` | `third_party/build_wpa.sh` | camera | WiFi client |
 | `LamaxTool.exe` | `tools/build_exe.ps1` | Windows | backup / flash / SD card tool |
 | `LamaxTool` | `tools/build_linux.sh` | Linux x86-64 | same tool for Linux |
+| `LamaxTool.app` | `tools/build_macos.sh` / GitHub Actions | macOS (Apple Silicon) | same tool for macOS |
 | `release-<ver>/` | `tools/make_release.ps1` | – | files for a GitHub release |
 
 `build.sh` copies the camera programs into `sdcard/cam/bin/`; LamaxTool embeds the
@@ -131,6 +132,35 @@ per-user pip install if `python3-venv` is missing. PyInstaller binaries run on s
 with the same or a newer glibc than the build machine (Ubuntu 22.04 → glibc 2.35), so
 build on the oldest distribution you want to support.
 
+### macOS (Apple Silicon)
+
+PyInstaller cannot cross-compile, so the Mac app is built on a Mac – or by GitHub:
+the workflow `.github/workflows/build-macos.yml` builds the camera programs on Linux
+(NDK r21e + wpa_supplicant, exactly as above) and then `LamaxTool.app` on an arm64
+macOS runner. Start it from the Actions tab (**Run workflow**); it also runs on every push
+to `main` that touches the tool or the camera programs. The result is the artifact
+`LamaxTool-macOS-arm64` (a zip of `LamaxTool.app`).
+
+On a Mac with the camera programs already in `sdcard/cam/bin` (copied from a Linux/WSL build):
+
+```bash
+bash tools/build_macos.sh     # -> dist/LamaxTool.app, dist/LamaxTool-macOS-arm64.zip
+```
+
+Needs a python3 with tkinter (python.org installer, or `brew install python-tk`). The app is
+only ad-hoc signed (PyInstaller does that), so Gatekeeper asks once: right-click → Open.
+Its data folder is `~/LamaxTool` (backups, platform-tools, `LamaxTool_settings.txt`),
+because the app bundle itself is read-only.
+
+### Committed builds
+
+`dist/LamaxTool.exe` and `dist/LamaxTool` are committed (everything else in `dist/` is
+ignored), so a fresh clone works without building. After changing `tools/`, `boot/`,
+`sdcard/` or the camera programs, rebuild **both** and commit them with the change –
+they contain the camera programs and `autorun.sh` from the time they were built.
+`git add` keeps the Linux file's executable bit only if it was already set; on Windows:
+`git update-index --chmod=+x dist/LamaxTool`.
+
 ### From source (any OS with Python 3.9+ and tkinter)
 
 ```bash
@@ -199,5 +229,8 @@ filesystem type): `bash tools/build_debug.sh disptest`.
 ## 9. Clean
 
 ```bash
-rm -rf out build dist sdcard/cam/bin
+rm -rf out build sdcard/cam/bin
 ```
+
+`dist/` is left alone: besides the committed builds it may hold `backups/` (your flash
+backups, if LamaxTool was run from there) and `LamaxTool_settings.txt`.

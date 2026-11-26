@@ -5,6 +5,7 @@
 *.h             text eol=lf
 *.py            text eol=lf
 *.md            text eol=lf
+*.yml           text eol=lf
 .gitignore      text eol=lf
 .gitattributes  text eol=lf
 
@@ -15,3 +16,4 @@ sdcard/cam/config.txt  text eol=crlf
 *.bin           binary
 *.img           binary
 *.exe           binary
+dist/LamaxTool  binary

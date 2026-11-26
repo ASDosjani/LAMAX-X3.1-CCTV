@@ -63,12 +63,12 @@ int main(int argc, char **argv)
 
     int w = config_int(cfg, "VIDEO_WIDTH", 1920);
     int h = config_int(cfg, "VIDEO_HEIGHT", 1080);
-    int fps = config_int(cfg, "VIDEO_FPS", 25);
-    int kbps = config_int(cfg, "VIDEO_BITRATE_KBPS", 4000);
+    int fps = config_int(cfg, "VIDEO_FPS", 15);
+    int kbps = config_int(cfg, "VIDEO_BITRATE_KBPS", 3000);
     int gop_s = config_int(cfg, "VIDEO_GOP_SECONDS", 2);
     int flip = config_int(cfg, "VIDEO_FLIP", 0);
     int use_wd = config_int(cfg, "WATCHDOG", 1);
-    if (fps < 1 || fps > 30) fps = 25;
+    if (fps < 1 || fps > 30) fps = 15;
     if (kbps < 200) kbps = 200;
     if (kbps > 12000) kbps = 12000;
 
@@ -104,7 +104,8 @@ int main(int argc, char **argv)
         .width = cap.width, .height = cap.height, .stride = cap.bytesperline, .fps = fps,
         .bitrate = kbps * 1000, .gop = fps * (gop_s > 0 ? gop_s : 2),
         .profile = profile_of(config_get(cfg, "VIDEO_PROFILE", "main")),
-        .level = cap.width * cap.height > 1280 * 720 ? 40 : 31,
+        /* 3.1 up to 720p, 4.0 up to 1080p, 5.0 above (2688x1520) */
+        .level = cap.width * cap.height > 1920 * 1088 ? 50 : cap.width * cap.height > 1280 * 720 ? 40 : 31,
     };
     h264enc_t *enc = h264enc_open(&ec);
     if (!enc) return 1;
@@ -115,7 +116,8 @@ int main(int argc, char **argv)
         setenv("TZ", config_get(cfg, "TIMEZONE", "CET-1CEST,M3.5.0,M10.5.0/3"), 1);
         tzset();
         osd = osd_create(cap.width, cap.height, config_get(cfg, "OSD_POSITION", "top-left"),
-                         config_int(cfg, "OSD_NAME", 0) ? config_get(cfg, "CAMERA_NAME", "") : NULL);
+                         config_int(cfg, "OSD_NAME", 0) ? config_get(cfg, "CAMERA_NAME", "") : NULL,
+                         config_int(cfg, "OSD_BATTERY", 1));
         if (osd) h264enc_set_overlay(enc, (h264enc_overlay_fn)osd_draw, osd);
         LOGI("osd: time stamp %s, TZ=%s", config_get(cfg, "OSD_POSITION", "top-left"), getenv("TZ"));
     }
