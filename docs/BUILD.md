@@ -1,7 +1,8 @@
 # Building
 
 This page walks through a complete build from a fresh Windows machine: the camera
-programs, wpa_supplicant, LamaxTool for Windows and Linux, and the release package.
+programs, wpa_supplicant, Dropbear (SSH), LamaxTool for Windows, Linux and macOS, and the
+release package.
 Building on a plain Linux machine works the same way – skip the WSL part and run the
 `bash` commands directly.
 
@@ -9,21 +10,22 @@ Building on a plain Linux machine works the same way – skip the WSL part and r
 
 | Output | Built by | Runs on | Purpose |
 |---|---|---|---|
-| `camd` | `build.sh` | camera | camera → H.264 → RTSP server, date/time in the picture (`osd.c`), watchdog |
-| `camui` | `build.sh` | camera | screen, buttons, WiFi scan page, battery/CPU/temperature |
+| `camd` | `build.sh` | camera | camera → H.264 → RTSP server (Digest login), date/time in the picture (`osd.c`), microphone → G.711 → RTSP track 2 (`audio.c`, `alsa.c`, `AUDIO=1`), watchdog |
+| `camui` | `build.sh` | camera | screen, buttons, WiFi scan page, battery/CPU/temperature, low-battery power-off |
 | `camled` | `build.sh` | camera | status LEDs |
-| `camd` audio | `src/audio.c`, `src/alsa.c` | camera | microphone → G.711 → RTSP track 2 (`AUDIO=1`) |
 | `camcfg` | `build.sh` | camera | configuration over WiFi for LamaxTool (HTTP + Digest, only with `ADMIN_PASSWORD`), and the intercom (`/api/talk`: one-time token, encrypted 16 kHz stream played with `src/alsa.c`; LamaxTool records the microphone with `sounddevice`/PortAudio, installed by the build scripts); `config.txt` encrypted with `src/seal.c` (SHA-256, HMAC, PBKDF2, ChaCha20 – checked against the FIPS 180 / RFC 4231 / RFC 8439 test vectors; LamaxTool has the same in Python) |
-| `camnet` | `build.sh` | camera | network helper for `autorun.sh` (static IP, config values, SNTP clock) |
+| `camnet` | `build.sh` | camera | network helper for `autorun.sh` (static IP, config values, SNTP clock, WiFi power saving off) |
 | `camtest` | `build.sh` | camera | capture + encode test (development only) |
 | `wpa_supplicant`, `wpa_cli` | `third_party/build_wpa.sh` | camera | WiFi client |
-| `LamaxTool.exe` | `tools/build_exe.ps1` | Windows | backup / flash / SD card tool |
+| `dropbearmulti` | `third_party/build_dropbear.sh` | camera | SSH server (Dropbear 2026.94) + `dropbearkey` + `scp`, see section 5b |
+| `LamaxTool.exe` | `tools/build_exe.ps1` | Windows | backup / flash / SD card / settings / intercom tool, over USB or WiFi |
 | `LamaxTool` | `tools/build_linux.sh` | Linux x86-64 | same tool for Linux |
 | `LamaxTool.app` | `tools/build_macos.sh` / GitHub Actions | macOS (Apple Silicon) | same tool for macOS |
 | `release-<ver>/` | `tools/make_release.ps1` | – | files for a GitHub release |
 
-`build.sh` copies the camera programs into `sdcard/cam/bin/`; LamaxTool embeds the
-whole `sdcard/cam` folder and the boot hook, so build the camera programs **first**.
+`build.sh` copies the camera programs into `sdcard/cam/bin/` (the third-party scripts put
+theirs there too); LamaxTool embeds the whole `sdcard/cam` folder, the boot hook and the
+reference boot image from `ORIGINAL_FW/`, so build the camera programs **first**.
 
 ## 1. Prerequisites
 
@@ -111,6 +113,28 @@ and builds with:
 The stock firmware still references `/system/bin/wpa_supplicant` in `init.rc`, but the
 binary was removed from the camera, which is why it is built here.
 
+## 5b. Dropbear SSH server (once, or after changing its patches)
+
+```bash
+bash third_party/build_dropbear.sh     # -> sdcard/cam/bin/dropbearmulti
+```
+
+Downloads `dropbear-2026.94.tar.bz2` from matt.ucc.asn.au (SHA-256 checked; the release is
+also GPG-signed) into `~/lamax/build/dropbear` and builds one multi-call binary
+(`dropbear`, `dropbearkey`, `scp`). Patches for Android 4.2 / bionic:
+
+* **password check**: bionic has no `crypt()` and no `/etc/shadow`, so the check compares
+  (constant time) with `/dev/cam/ssh.pw`, which `autorun.sh` writes from `ADMIN_PASSWORD`
+  (root-only, RAM); a wrong password costs 1 s. Key login, agent/X11 forwarding are off.
+* **terminals**: `USE_DEV_PTMX` – the camera has `/dev/ptmx` + devpts, which `configure`
+  cannot see when cross-compiling (without it: "PTY allocation request failed").
+* **environment**: sessions keep `ANDROID_PROPERTY_WORKSPACE` (and the other `ANDROID_*`,
+  `BOOTCLASSPATH`, `LD_LIBRARY_PATH` variables) and its file descriptor, so `getprop` works.
+* shell `/system/bin/sh`, `PATH=/dev/cam:/system/bin:/system/xbin`, host key in
+  `/mnt/extsd/cam/ssh/`.
+
+Newer OpenSSH clients use SFTP for `scp`; this build has no SFTP server, so use `scp -O`.
+
 ## 6. LamaxTool
 
 ### Windows (PowerShell, in the repository folder)
@@ -120,8 +144,10 @@ binary was removed from the camera, which is why it is built here.
 ```
 
 Creates a virtual environment in `%TEMP%\lamaxtool-venv` (short path – deep paths can
-break pip), installs PyInstaller and builds `dist\LamaxTool.exe` (single file,
-about 11 MB, no console window).
+break pip), installs PyInstaller, `sounddevice` (microphone for the intercom, with PortAudio)
+and `paramiko` (SSH, for the WiFi functions), and builds `dist\LamaxTool.exe` (single file,
+about 20 MB, no console window). numpy is excluded (`sounddevice` can use it but does not
+need it).
 
 ### Linux (x86-64)
 
@@ -129,8 +155,10 @@ about 11 MB, no console window).
 bash tools/build_linux.sh
 ```
 
-Builds `dist/LamaxTool` (about 12 MB). Uses a venv in `~/.cache/lamaxtool-venv`, or a
-per-user pip install if `python3-venv` is missing. PyInstaller binaries run on systems
+Builds `dist/LamaxTool` (about 17 MB, same packages as on Windows). Uses a venv in
+`~/.cache/lamaxtool-venv`, or a per-user pip install if `python3-venv` is missing. On Linux
+`sounddevice` uses the system's PortAudio: the intercom needs `libportaudio2` on the user's
+machine. PyInstaller binaries run on systems
 with the same or a newer glibc than the build machine (Ubuntu 22.04 → glibc 2.35), so
 build on the oldest distribution you want to support.
 
@@ -138,7 +166,7 @@ build on the oldest distribution you want to support.
 
 PyInstaller cannot cross-compile, so the Mac app is built on a Mac – or by GitHub:
 the workflow `.github/workflows/build-macos.yml` builds the camera programs on Linux
-(NDK r21e + wpa_supplicant, exactly as above) and then `LamaxTool.app` on an arm64
+(NDK r21e + wpa_supplicant + Dropbear, exactly as above) and then `LamaxTool.app` on an arm64
 macOS runner. Start it from the Actions tab (**Run workflow**); it also runs on every push
 to `main` that touches the tool or the camera programs. The result is the artifact
 `LamaxTool-macOS-arm64` (a zip of `LamaxTool.app`).
@@ -171,8 +199,11 @@ python3 tools/lamax_tool.py
 
 Runtime requirements of the tool: `adb` (found on PATH, in `platform-tools/` next to
 the program, in `~/Downloads/platform-tools`, or downloaded on first use). The WiFi
-scan runs on the camera, so nothing else is needed on the computer.
+scan runs on the camera. Optional Python packages: `sounddevice` (🎤 Talk) and `paramiko`
+(flash / SD card functions over WiFi); without them those functions say what is missing.
 On Linux adb needs a udev rule for USB vendor `1f3a` (see README).
+Next to the program the tool keeps `backups/`, `LamaxTool_settings.txt` (passwords included)
+and `LamaxTool_known_hosts` (the cameras' SSH keys).
 
 ## 7. Release package
 
@@ -183,8 +214,8 @@ On Linux adb needs a udev rule for USB vendor `1f3a` (see README).
 Collects into `dist\release-1.0.0\`:
 
 * `LamaxTool.exe` and `LamaxTool` (whichever has been built),
-* `sdcard.zip` – the `cam` folder (`autorun.sh`, the `config.txt` template, `bin/`) for
-  preparing cards by hand,
+* `sdcard.zip` – the `cam` folder (`autorun.sh`, the `config.txt` template, `bin/` with all
+  camera programs including `camcfg` and `dropbearmulti`) for preparing cards by hand,
 * `SHA256SUMS.txt`.
 
 Upload these to a GitHub release. **Never publish** flash backups (`backups/`), boot
@@ -219,6 +250,11 @@ adb shell 'for p in /proc/[0-9]*; do case "$(cat $p/cmdline)" in /dev/cam/camui*
 
 `autorun.sh` restarts a missing program within 3 s. For `autorun.sh` itself, push it
 to the card, check it with `adb shell sh -n /mnt/extsd/cam/autorun.sh` and reboot.
+The camera has no `ln`, `grep`, `mv` or `date` (toolbox only), so scripts use `cp`,
+`case` and `/proc/uptime` instead.
+
+**Over WiFi** (admin password set): `ssh root@<ip>` and `scp -O file root@<ip>:/mnt/extsd/cam/bin/`
+work the same way as adb above.
 
 **Screenshot of the camera screen:** `adb shell cat /dev/graphics/fb0 > fb.raw` gives a
 220×176 BGRA dump (stride 880 bytes; page 0 is shown).
@@ -234,5 +270,7 @@ filesystem type): `bash tools/build_debug.sh disptest`.
 rm -rf out build sdcard/cam/bin
 ```
 
-`dist/` is left alone: besides the committed builds it may hold `backups/` (your flash
-backups, if LamaxTool was run from there) and `LamaxTool_settings.txt`.
+After this, run `build.sh`, `third_party/build_wpa.sh` and `third_party/build_dropbear.sh`
+again (the downloaded sources stay in `~/lamax/build`). `dist/` is left alone: besides the
+committed builds it may hold `backups/` (your flash backups, if LamaxTool was run from
+there), `LamaxTool_settings.txt` and `LamaxTool_known_hosts`.

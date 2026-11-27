@@ -7,7 +7,7 @@ JDQ39 20211105`, camera firmware version 20210820).
 
 | | |
 |---|---|
-| SoC | Allwinner V3 (sun8iw8), single Cortex-A7, 128 MB DDR3 (Samsung K4B1G1646) |
+| SoC | Allwinner V3 (sun8iw8), single Cortex-A7, 128 MB DDR3 (Samsung K4B1G1646); Linux sees only 32 MB (`MemTotal`), the rest is reserved for the camera/encoder buffers |
 | Flash | 8 MB SPI NOR |
 | Sensor | Sony IMX175 (`imx175.ko`), via `vfe_v4l2` with in-kernel ISP |
 | WiFi | XRadio XR819, 2.4 GHz only, SDIO (`xradio_mac` → `xradio_core` → `xradio_wlan`) |
@@ -24,6 +24,17 @@ adb is a root shell. The stock `sdv` also feeds `/dev/watchdog` (6–8 s timeout
 Flash layout: see [INSTALL.md](INSTALL.md). `system` is squashfs (xz), `cfg` is jffs2
 mounted on `/data`, `boot` is an Android boot image (kernel + gzip newc ramdisk,
 page 2048, ~28 KB free). `script.bin` (board config) lives in `uboot` at offset 0x32000.
+
+* **Every camera has the same adb serial, `20080411`**, and `ro.serialno` is empty, so
+  cameras cannot be told apart by serial.
+* **Units with the same build (`20211105`) can carry different firmware revisions**: two
+  cameras had different `system` squashfs images (4 MB differ) and 14 differing bytes in
+  `uboot`. LamaxTool therefore only writes a boot image whose backup's `system` partition is
+  identical to the camera's. `ORIGINAL_FW/` holds one untouched camera's full dump.
+* The stock app shows an RF receiver version `ns_rf_rx_V1.2 2020-9-27` (for LAMAX's wireless
+  remote); Linux has an input device `keyboard-gpioirkey` (`/dev/input/event1`) that is
+  probably it. Not explored further.
+* The shell is Android's toolbox: no busybox, `grep`, `ln`, `mv`, `date`, `tty`, `getevent`.
 
 ## Video capture and encoding
 
@@ -70,12 +81,12 @@ page 2048, ~28 KB free). `script.bin` (board config) lives in `uboot` at offset 
 * Playing with plain tinyalsa (`tinyplay`, or `libtinyalsa.so` via dlopen) stalls on card 0:
   the stream is RUNNING but `hw_ptr` stops after 56 frames, writes fail with EIO after
   ~10 s, no DMA interrupts – even with the stock software running, same `pcm_config`
-  (1024 × 4, RW_INTERLEAVED). `startup_music` works every time, so `autorun.sh` uses it for
-  `cam/startup.wav`. A stalled tinyplay attempt can make the next `startup_music` run fail too.
+  (1024 × 4, RW_INTERLEAVED). The cause is the missing `Speaker Function` write (above);
+  `startup_music` works because it does that write. A stalled attempt can make the next
+  playback fail too.
 * The speaker level is `Line Volume` (0–31); `Master Playback Volume` stays 0 and `Audio speaker
-  out` reads Off while sound plays. `startup_music` sets Line Volume to 29 when it starts;
-  `autorun.sh` sets it back to 31 right after. LamaxTool normalises the WAV and adds a tanh soft
-  limiter (≈ +9 dB RMS), which still sounded clean on the camera.
+  out` reads Off while sound plays. `startup_music` sets Line Volume to 29; the intercom
+  (`camcfg`) sets it to 31.
 
 ## WiFi link
 
@@ -86,6 +97,17 @@ page 2048, ~28 KB free). `script.bin` (board config) lives in `uboot` at offset 
   of mW, only while nobody watches) is negligible next to the camera's 1.5-2 W. On a network with several access points the
   camera also roams between them; a busy or distant one gives 200–300 ms even with power
   saving off – then lower the bitrate, or use TCP in the player.
+
+## SSH (Dropbear) on Android 4.2
+
+* bionic has no `crypt()`, `getspnam()` or `/etc/shadow`; `getpwnam("root")` works
+  (Android's built-in IDs: home `/`, shell `/system/bin/sh`, no password field).
+* `/dev/ptmx` and devpts exist; `grantpt()` is missing before API 21 (the NDK supplies an
+  inline stand-in). `openpty()` is not available.
+* Android programs find the system properties through `ANDROID_PROPERTY_WORKSPACE=fd,size`
+  and that inherited file descriptor (`/dev/__properties__`); a daemon that clears the
+  environment or closes inherited descriptors breaks `getprop` for its children.
+* Memory: the Dropbear listener ~0.5 MB RSS, ~0.45 MB per session.
 
 ## Clock
 
@@ -116,7 +138,8 @@ page 2048, ~28 KB free). `script.bin` (board config) lives in `uboot` at offset 
   (active low; I2C, too slow for PWM).
 * The **red** LED is the AXP209 charge LED (hardware).
 * Keys: `/dev/input/event0` sunxi-keyboard (codes 139, 114, 115), power key on
-  `/dev/input/event2` (axp, code 116).
+  `/dev/input/event2` (axp, code 116); `event1` keyboard-gpioirkey (remote receiver, see
+  Software), `event3` headset.
 
 ## Power
 

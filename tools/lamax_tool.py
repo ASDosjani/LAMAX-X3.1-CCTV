@@ -87,6 +87,103 @@ class Adb:
         self.run('pull', remote, local, timeout=timeout)
 
 
+class CamSsh:
+    """The camera over WiFi through its SSH server (Dropbear, user root, the admin
+    password): the same interface as Adb (sh / push / pull / run), so every USB function
+    works over WiFi too. Files go through "cat" on an exec channel (Dropbear has no SFTP).
+    The camera's host key is remembered on first use; a changed key is refused."""
+    KNOWN_HOSTS = os.path.join(HOME, 'LamaxTool_known_hosts')
+
+    def __init__(self, host, passwords, port=22):
+        try:
+            import paramiko
+        except ImportError as e:
+            raise RuntimeError('No SSH support in this build (%s).' % e)
+        self.host, self.serial = host, 'wifi-' + host
+        c = paramiko.SSHClient()
+        if os.path.isfile(self.KNOWN_HOSTS):
+            c.load_host_keys(self.KNOWN_HOSTS)
+
+        class Remember(paramiko.MissingHostKeyPolicy):          # trust on first use, then pinned
+            def missing_host_key(self_, client, hostname, key):
+                client.get_host_keys().add(hostname, key.get_name(), key)
+                try:
+                    client.save_host_keys(CamSsh.KNOWN_HOSTS)
+                except OSError:
+                    pass
+        c.set_missing_host_key_policy(Remember())
+        last = None
+        for pw in [p for i, p in enumerate(passwords) if p and p not in passwords[:i]]:
+            try:
+                c.connect(host, port, 'root', pw, look_for_keys=False, allow_agent=False,
+                          timeout=10, banner_timeout=10, auth_timeout=15)
+                self.client, self.password = c, pw
+                return
+            except paramiko.AuthenticationException as e:
+                last = e
+            except paramiko.BadHostKeyException:
+                raise RuntimeError('The SSH key of %s is not the one seen before. If the camera got a new SD card '
+                                   'this is expected: delete its line from %s. Otherwise someone may be '
+                                   'impersonating the camera.' % (host, self.KNOWN_HOSTS))
+            except (OSError, paramiko.SSHException) as e:
+                raise RuntimeError('No SSH connection to %s (%s). The camera needs the current programs '
+                                   '(with SSH) and an admin password.' % (host, e))
+        raise RuntimeError('SSH: wrong admin password for %s (%s).' % (host, last))
+
+    def _exec(self, cmd, timeout, data=None, out_file=None):
+        ch = self.client.get_transport().open_session()
+        ch.settimeout(timeout)
+        ch.exec_command(cmd)
+        if data is not None:
+            for i in range(0, len(data), 32768):
+                ch.sendall(data[i:i + 32768])
+            ch.shutdown_write()
+        out = []
+        while True:
+            d = ch.recv(65536)
+            if not d:
+                break
+            if out_file:
+                out_file.write(d)
+            else:
+                out.append(d)
+        err = b''
+        while ch.recv_stderr_ready():
+            err += ch.recv_stderr(65536)
+        code = ch.recv_exit_status()
+        ch.close()
+        return code, b''.join(out), err
+
+    def sh(self, script, timeout=120):
+        code, out, err = self._exec(script, timeout)
+        return (out + err).decode('utf-8', 'replace').replace('\r\n', '\n')
+
+    def push(self, local, remote, timeout=300):
+        code, _, err = self._exec("cat > '%s'" % remote, timeout, data=open(local, 'rb').read())
+        if code != 0:
+            raise RuntimeError('ssh push %s failed: %s' % (remote, err.decode('utf-8', 'replace').strip()))
+
+    def pull(self, remote, local, timeout=300):
+        with open(local, 'wb') as f:
+            code, _, err = self._exec("cat '%s'" % remote, timeout, out_file=f)
+        if code != 0:
+            raise RuntimeError('ssh pull %s failed: %s' % (remote, err.decode('utf-8', 'replace').strip()))
+
+    def run(self, *args, timeout=120, check=True):
+        """adb-style commands used by the tool: shell / reboot."""
+        if args and args[0] == 'shell':
+            return self.sh(' '.join(args[1:]), timeout)
+        if args and args[0] == 'reboot':           # detached: the connection drops with the reboot
+            return self.sh("(trap '' HUP; sleep 1; sync; reboot) >/dev/null 2>&1 &", 10)
+        raise RuntimeError('not available over SSH: %s' % ' '.join(args))
+
+    def close(self):
+        try:
+            self.client.close()
+        except Exception:
+            pass
+
+
 # ----------------------------------------------------------------------------- encrypted envelope
 # Same format as src/seal.c: the config.txt contents travel encrypted over WiFi.
 #   master = PBKDF2-HMAC-SHA256(admin password, "lamax-x31-camcfg-v1", 20000), per message a random
@@ -264,8 +361,8 @@ class Talker:
 
 class CamNet:
     """The camera over WiFi: camcfg's HTTP API (Digest login, user "admin",
-    password ADMIN_PASSWORD). Only settings, reboot, WiFi scan and status -
-    flashing needs USB."""
+    password ADMIN_PASSWORD): settings, reboot, WiFi scan, status, intercom.
+    Shell work (flash, SD card) goes through CamSsh."""
 
     class WrongPassword(Exception):
         pass
@@ -464,6 +561,8 @@ def find_original_boot(adb, serial, log):
 
 
 FLASH_SCRIPT = '''
+# keep going if the connection drops (WiFi/SSH): never stop halfway through a flash
+trap '' HUP INT TERM PIPE
 cmp /dev/lt_new.img /dev/block/mtdblock1 >/dev/null 2>&1 && { echo ALREADY; rm -f /dev/lt_*.img; exit 0; }
 cat /dev/lt_new.img > /dev/block/mtdblock1
 sync
@@ -569,13 +668,11 @@ SETTINGS = [
     ('RTSP', 'RTSP_MAX_CLIENTS', 'Max. clients', 'int', (1, 8)),
     ('RTSP', 'AUDIO', 'Microphone sound in the stream (G.711)', 'bool', ('1', '0')),
     ('RTSP', 'AUDIO_GAIN', 'Microphone gain (0-7)', 'int', (0, 7)),
-    ('Remote', 'ADMIN_PASSWORD', 'Admin password (empty = USB only)', 'password', None),
+    ('Remote', 'ADMIN_PASSWORD', 'Admin password (WiFi + SSH; empty = USB only)', 'password', None),
     ('Remote', 'ADMIN_PORT', 'Port', 'int', (1, 65535)),
     ('Device', 'MODE', 'Mode', 'choice', ['camera', 'stock']),
     ('Device', 'SCREEN_TIMEOUT', 'Screen off after (s, 0 = never)', 'int', (0, 3600)),
-    ('Device', 'LED', 'Status LEDs', 'bool', ('on', 'off')),
-    ('Device', 'STARTUP_SOUND', 'Startup sound when on the network', 'bool', ('1', '0')),
-    ('Device', 'BATTERY_LONG_LIFE', 'Battery long life (charge to ~85-90 %, off at 10 %)', 'bool', ('1', '0')),
+    ('Device', 'LED', 'Status LEDs', 'bool', ('on', 'off')),    ('Device', 'BATTERY_LONG_LIFE', 'Battery long life (charge to ~85-90 %, off at 10 %)', 'bool', ('1', '0')),
     ('Device', 'WATCHDOG', 'Reboot if the stream hangs', 'bool', ('1', '0')),
     ('Device', 'LOG', 'Log (sd / ram = not on the card / off)', 'choice', ['sd', 'ram', 'off']),
     ('Device', 'WIFI_DEBUG_LOG', 'Detailed WiFi log (on the card)', 'bool', ('1', '0')),]
@@ -598,7 +695,7 @@ FALLBACK_DEFAULTS = {'CAMERA_NAME': 'camera1', 'IP_MODE': 'dhcp', 'IP_ADDRESS': 
                      'VIDEO_WIDTH': '1920', 'VIDEO_HEIGHT': '1080', 'VIDEO_FPS': '15',
                      'VIDEO_BITRATE_KBPS': '3000', 'VIDEO_GOP_SECONDS': '2', 'VIDEO_PROFILE': 'main',
                      'VIDEO_FLIP': '0', 'RTSP_PORT': '554', 'RTSP_PATH': 'stream', 'RTSP_MAX_CLIENTS': '4',
-                     'ADMIN_PASSWORD': '', 'ADMIN_PORT': '8080', 'STARTUP_SOUND': '1',
+                     'ADMIN_PASSWORD': '', 'ADMIN_PORT': '8080',
                      'AUDIO': '0', 'AUDIO_GAIN': '7',
                      'MODE': 'camera', 'SCREEN_TIMEOUT': '60', 'LED': 'on', 'BATTERY_LONG_LIFE': '1',
                      'WATCHDOG': '1', 'WIFI_DEBUG_LOG': '0', 'LOG': 'off', 'OSD_TIME': '1', 'OSD_NAME': '0', 'OSD_BATTERY': '1',
@@ -755,54 +852,6 @@ def make_config(values):
     return text.replace('\r\n', '\n').replace('\n', '\r\n')    # Notepad-friendly
 
 
-SOUND_RATE, SOUND_MAX_S = 22050, 10
-
-
-def convert_sound(path):
-    """Any PCM WAV -> 16-bit mono 22050 Hz WAV bytes (at most 10 s), which the
-    camera's startup_music player handles."""
-    import array, wave
-    try:
-        w = wave.open(path, 'rb')
-    except (wave.Error, EOFError) as e:
-        raise RuntimeError('%s is not a PCM WAV file (%s). Convert it to WAV first, '
-                           'e.g. with Audacity.' % (os.path.basename(path), e))
-    with w:
-        ch, sw, rate, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
-        n = min(n, rate * SOUND_MAX_S)
-        raw = w.readframes(n)
-    n = len(raw) // (sw * ch)
-    if sw == 1:
-        s = [(b - 128) / 128.0 for b in raw]
-    elif sw == 2:
-        s = [v / 32768.0 for v in array.array('h', raw[:n * ch * 2])]
-    elif sw in (3, 4):
-        s = [int.from_bytes(raw[i:i + sw], 'little', signed=True) / float(1 << (8 * sw - 1))
-             for i in range(0, n * ch * sw, sw)]
-    else:
-        raise RuntimeError('Unsupported WAV sample size: %d bytes' % sw)
-    mono = [sum(s[i * ch:(i + 1) * ch]) / ch for i in range(n)]
-    # as loud as the small speaker allows: normalise, then a soft limiter (tanh, about +9 dB)
-    peak = max((abs(v) for v in mono), default=0) or 1.0
-    import math
-    drive = 3.0
-    mono = [math.tanh(drive * v / peak) / math.tanh(drive) * 0.98 for v in mono]
-    m = int(n * SOUND_RATE / rate)
-    out = array.array('h')
-    for i in range(m):
-        x = i * rate / SOUND_RATE
-        j = int(x)
-        a = mono[j]
-        b = mono[j + 1] if j + 1 < n else a
-        v = a + (b - a) * (x - j)
-        out.append(max(-32768, min(32767, int(round(v * 32767)))))
-    buf = io.BytesIO()
-    with wave.open(buf, 'wb') as o:
-        o.setnchannels(1); o.setsampwidth(2); o.setframerate(SOUND_RATE)
-        o.writeframes(out.tobytes())
-    return buf.getvalue()
-
-
 def sd_files():
     files = [('autorun.sh', os.path.join(SD_SRC, 'autorun.sh'))]
     bindir = os.path.join(SD_SRC, 'bin')
@@ -813,7 +862,7 @@ def sd_files():
     return files
 
 
-def write_sd_adb(adb, config_text, log, sound=None):
+def write_sd_adb(adb, config_text, log):
     mounts = adb.sh('cat /proc/mounts')
     if ' /mnt/extsd ' not in mounts:
         raise RuntimeError('The SD card is not mounted on the camera. If the camera shows the USB mode '
@@ -827,27 +876,23 @@ def write_sd_adb(adb, config_text, log, sound=None):
         p = os.path.join(tmp, 'config.txt')
         open(p, 'w', encoding='utf-8', newline='').write(config_text)
         adb.push(p, '/mnt/extsd/cam/config.txt')
-        if sound:
-            p = os.path.join(tmp, 'startup.wav')
-            open(p, 'wb').write(sound)
-            adb.push(p, '/mnt/extsd/cam/startup.wav')
-            log('  cam/startup.wav')
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     log('  cam/config.txt written')
-    adb.sh('sync')
+    adb.sh('rm -f /mnt/extsd/cam/startup.wav; sync')     # own startup sound: no longer used
     log('SD card ready.')
 
 
-def write_sd_folder(root, config_text, log, sound=None):
+def write_sd_folder(root, config_text, log):
     dst = os.path.join(root, 'cam')
     os.makedirs(os.path.join(dst, 'bin'), exist_ok=True)
     for rel, src in sd_files():
         shutil.copyfile(src, os.path.join(dst, rel.replace('/', os.sep)))
         log('  cam/' + rel)
-    if sound:
-        open(os.path.join(dst, 'startup.wav'), 'wb').write(sound)
-        log('  cam/startup.wav')
+    try:
+        os.remove(os.path.join(dst, 'startup.wav'))       # own startup sound: no longer used
+    except OSError:
+        pass
     open(os.path.join(dst, 'config.txt'), 'w', encoding='utf-8', newline='').write(config_text)
     log('  cam/config.txt written')
     log('Files copied to %s - eject the drive safely before removing the card.' % dst)
@@ -960,7 +1005,6 @@ class App(tk.Tk):
         self.serial = tk.StringVar()
         self.conn = tk.StringVar(value='usb')          # usb / wifi
         self.cam_ip = tk.StringVar()
-        self.sound_path = tk.StringVar()               # WAV for cam/startup.wav (on this PC)
         self.status = tk.StringVar(value='')
         self._build()
         self._pump_id = self.after(100, self._pump)
@@ -1069,22 +1113,12 @@ class App(tk.Tk):
         self.rtsp_link = tk.StringVar()
         ttk.Entry(lf, textvariable=self.rtsp_link, state='readonly', width=48).pack(side='left', padx=4)
         button(lf, '📋 Copy', self.copy_rtsp_link)
-        # Device tab: own startup sound (converted and copied to cam/startup.wav when writing the SD card)
-        sf = ttk.Frame(tabs['Device']); sf.grid(row=50, column=0, columnspan=4, sticky='we', padx=4, pady=(8, 2))
-        ttk.Label(sf, text='Startup sound (WAV):').pack(side='left')
-        ttk.Entry(sf, textvariable=self.sound_path, state='readonly', width=36).pack(side='left', padx=4)
-        button(sf, '📂 Choose...', self.choose_sound)
-        button(sf, '✖', lambda: self.sound_path.set(''), padx=(2, 0))
-        self.usb_only_btns.append(button(sf, '▶ Play on camera (USB)', self.do_play_sound, padx=(6, 0)))
-        ttk.Label(tabs['Device'], style='Hint.TLabel', text=
-                  'Written to cam/startup.wav with the SD card (USB or card reader), played when the camera is on '
-                  'the network.\nNo file chosen = the sound on the card stays. The original power-on sound stays too.'
-                  ).grid(row=51, column=0, columnspan=4, sticky='w', padx=4)
         ttk.Label(tabs['Remote'], style='Hint.TLabel', justify='left', text=
-                  'With an admin password the camera can be configured over WiFi: choose "📶 WiFi" at the top\n'
-                  'and enter its IP. Read / write settings, WiFi scan, stream link and reboot then work without\n'
-                  'a cable (user name: admin). Over WiFi only config.txt is written, not the programs;\n'
-                  'flash backup and boot hook need USB. A new password takes effect after a restart.'
+                  'With an admin password everything works over WiFi too: choose "📶 WiFi" at the top and enter\n'
+                  'the camera IP. Settings, WiFi scan, stream link, reboot and talk go through the config service\n'
+                  '(user admin); flash backup, boot hook and writing the SD card (programs too) through SSH\n'
+                  '(user root, port 22, same password). The first SD write with SSH must be over USB.\n'
+                  'A new password takes effect after a restart. Terminal: ssh root@<camera IP>'
                   ).grid(row=50, column=0, columnspan=4, sticky='w', padx=4, pady=(8, 2))
         self._br_suggest = None
         for k in ('RESOLUTION', 'VIDEO_FPS'):
@@ -1147,14 +1181,14 @@ class App(tk.Tk):
         """Titles, button texts and USB-only buttons follow the 🔌 USB / 📶 WiFi choice."""
         wifi = self.wifi()
         self.flash_frame.configure(text=' 1 │ Camera flash  (once per camera%s) '
-                                   % (' – needs 🔌 USB' if wifi else ''))
-        self.write_frame.configure(text=' 3 │ Write to camera  (WiFi: only config.txt, encrypted) ' if wifi
-                                   else ' 3 │ Write to SD card  (programs + config.txt) ')
-        self.write_btn.configure(text='⬆  Write settings to camera (WiFi)' if wifi
+                                   % (' – over WiFi via SSH' if wifi else ''))
+        self.write_frame.configure(text=' 3 │ Write to camera SD card  (programs + config.txt, over WiFi via SSH) '
+                                   if wifi else ' 3 │ Write to SD card  (programs + config.txt) ')
+        self.write_btn.configure(text='⬆  Write to camera SD card (WiFi)' if wifi
                                  else '⬆  Write to camera SD card (USB)')
-        if not self.busy:
+        if not self.busy:                     # everything works over USB and over WiFi (SSH) now
             for b in self.usb_only_btns:
-                b.state(['disabled'] if wifi else ['!disabled'])
+                b.state(['!disabled'])
 
     def wifi(self):
         return self.conn.get() == 'wifi'
@@ -1175,14 +1209,12 @@ class App(tk.Tk):
         return CamNet(ip, port if port.isdigit() else '8080', [pw, getattr(self, '_net_pw_ok', '')])
 
     def run_task(self, title, fn, need_device=True, usb_only=False):
-        """fn(conn) in a worker thread; conn is an Adb (USB) or a CamNet (WiFi)."""
+        """fn(conn) in a worker thread. conn: an Adb (USB); over WiFi a CamNet (the config
+        service), or for shell tasks (usb_only) a CamSsh, which behaves like Adb."""
         if self.busy:
             return
         net = None
         if need_device and self.wifi():
-            if usb_only:
-                messagebox.showwarning(APP, '"%s" needs the camera on USB (choose "🔌 USB" at the top).' % title)
-                return
             net = self.camnet()
             if not net:
                 return
@@ -1191,14 +1223,20 @@ class App(tk.Tk):
                                         '(or choose "📶 WiFi" and enter its IP).')
             return
         self.set_busy(True)
-        self.log('--- %s%s' % (title, ' (WiFi %s)' % net.serial if net else ''))
+        shell = bool(net and usb_only)
+        self.log('--- %s%s' % (title, (' (WiFi %s, SSH)' if shell else ' (WiFi %s)') % net.host if net else ''))
         serial = self.serial.get() or None      # Tk variables are read in the GUI thread only
 
         def worker():
+            conn = None
             try:
-                adb = net or (Adb(self.adb_exe, serial) if self.adb_exe else None)
-                fn(adb)
-                if net:
+                if shell:
+                    conn = CamSsh(net.host, net.passwords)
+                    self._net_pw_ok = conn.password
+                else:
+                    conn = net or (Adb(self.adb_exe, serial) if self.adb_exe else None)
+                fn(conn)
+                if net and not shell:
                     self._net_pw_ok = net.password      # remembered for this session only
                 self.log('--- done')
             except Exception as e:      # shown to the user, never fatal
@@ -1206,6 +1244,8 @@ class App(tk.Tk):
                 self.log('ERROR: %s' % msg)
                 self.q.put(lambda: messagebox.showerror(APP, msg))
             finally:
+                if isinstance(conn, CamSsh):
+                    conn.close()
                 self.q.put(lambda: self.set_busy(False))
                 self.q.put(self.refresh)
         threading.Thread(target=worker, daemon=True).start()
@@ -1243,15 +1283,13 @@ class App(tk.Tk):
                 self.cfg[key].set(d.get(key, ''))
         known = {k for _, k, _, _, _ in SETTINGS} | {'VIDEO_WIDTH', 'VIDEO_HEIGHT', 'LED_MODE', 'LED_STREAM', 'BATTERY_CHARGE_LIMIT',
                                                      'LED_STATUS', 'LED_POWER', 'LED_INVERT',
-                                                     'WIFI_POWER_SAVE'}   # removed setting: dropped
+                                                     'WIFI_POWER_SAVE', 'STARTUP_SOUND'}   # removed settings: dropped
         self.extra_cfg = {k: v for k, v in values.items()       # kept when writing
                           if k not in known and not k.startswith('LAMAXTOOL_')}
         if values.get('LAMAXTOOL_CONNECTION') in ('usb', 'wifi'):
             self.conn.set(values['LAMAXTOOL_CONNECTION'])
         if values.get('LAMAXTOOL_CAMERA_IP'):
             self.cam_ip.set(values['LAMAXTOOL_CAMERA_IP'])
-        if 'LAMAXTOOL_STARTUP_SOUND' in values:
-            self.sound_path.set(values['LAMAXTOOL_STARTUP_SOUND'])
         if values.get('LAMAXTOOL_MIC_GAIN') in MIC_GAINS:
             self.mic_gain.set(values['LAMAXTOOL_MIC_GAIN'])
 
@@ -1283,7 +1321,6 @@ class App(tk.Tk):
         v = dict(values if values is not None else self.form_values())
         v['LAMAXTOOL_CONNECTION'] = self.conn.get()
         v['LAMAXTOOL_CAMERA_IP'] = self.cam_ip.get().strip()
-        v['LAMAXTOOL_STARTUP_SOUND'] = self.sound_path.get()
         v['LAMAXTOOL_MIC_GAIN'] = self.mic_gain.get()
         try:
             save_last_settings(v)
@@ -1407,23 +1444,23 @@ class App(tk.Tk):
     def do_backup(self):
         self.run_task('Back up flash', lambda adb: backup(adb, adb.serial, self.log), usb_only=True)
 
+    def target_name(self):
+        return ('%s (WiFi)' % self.cam_ip.get().strip()) if self.wifi() else self.serial.get()
+
     def do_install(self):
-        if self.wifi():
-            return self.run_task('Install boot hook', None, usb_only=True)
         if messagebox.askokcancel(APP, 'Install the SD-card boot hook on camera %s?\n\n'
                                        'The boot partition is rewritten (verified by read-back, the original is '
-                                       'restored automatically if verification fails). Do not unplug the camera '
-                                       'while it runs.' % self.serial.get()):
-            self.run_task('Install boot hook', lambda adb: install_hook(adb, adb.serial, self.log))
+                                       'restored automatically if verification fails). Do not unplug or switch off '
+                                       'the camera while it runs; over WiFi a dropped connection does not stop it.'
+                                       % self.target_name()):
+            self.run_task('Install boot hook', lambda adb: install_hook(adb, adb.serial, self.log), usb_only=True)
 
     def do_restore(self):
-        if self.wifi():
-            return self.run_task('Restore original boot', None, usb_only=True)
         if messagebox.askokcancel(APP, 'Write the original boot partition back to camera %s?\n\n'
                                        'Taken from this camera\'s own backup, or from ORIGINAL_FW - only if its '
                                        'system partition is identical to the camera\'s (checked first).'
-                                  % self.serial.get()):
-            self.run_task('Restore original boot', lambda adb: restore_boot(adb, adb.serial, self.log))
+                                  % self.target_name()):
+            self.run_task('Restore original boot', lambda adb: restore_boot(adb, adb.serial, self.log), usb_only=True)
 
     def do_reboot(self):
         def task(adb):
@@ -1552,18 +1589,27 @@ class App(tk.Tk):
             text = make_config(self.config_values())
         except Exception as e:
             messagebox.showerror(APP, str(e)); return
-        snd = self.sound_path.get()
         if not self.wifi():
-            self.run_task('Write SD card over adb', lambda adb: write_sd_adb(
-                adb, text, self.log, convert_sound(snd) if snd else None))
+            self.run_task('Write SD card over adb', lambda adb: write_sd_adb(adb, text, self.log))
             return
 
         def task(net):
-            net.write_config(text)
-            self.log('config.txt written over WiFi, encrypted (the programs are only updated over USB '
-                     'or a card reader).')
-            if snd:
-                self.log('Note: the startup sound is not sent over WiFi - write it over USB or a card reader.')
+            # over SSH: programs + config, exactly like USB. A camera with older
+            # programs has no SSH yet: then only config.txt, through the config service.
+            try:
+                ssh = CamSsh(net.host, net.passwords)
+            except RuntimeError as e:
+                ssh = None
+                self.log('SSH not available (%s) - writing only config.txt.' % str(e).splitlines()[0])
+            if ssh:
+                try:
+                    write_sd_adb(ssh, text, self.log)
+                finally:
+                    ssh.close()
+            else:
+                net.write_config(text)
+                self.log('config.txt written over WiFi, encrypted (the programs: over USB, '
+                         'or over WiFi once the camera has the programs with SSH).')
 
             def ask():
                 if messagebox.askyesno(APP, 'Settings saved on the camera. They take effect after a restart.\n\n'
@@ -1571,7 +1617,7 @@ class App(tk.Tk):
                                             'come back on WiFi - then fix them over USB.)'):
                     self.after(300, self.do_reboot)
             self.q.put(ask)
-        self.run_task('Write config.txt over WiFi', task)
+        self.run_task('Write the camera SD card over WiFi', task)
 
     def do_sd_folder(self):
         try:
@@ -1580,46 +1626,8 @@ class App(tk.Tk):
             messagebox.showerror(APP, str(e)); return
         root = filedialog.askdirectory(title='Select the SD card drive (its root folder)')
         if root:
-            snd = self.sound_path.get()
-            self.run_task('Write SD card to %s' % root, lambda _: write_sd_folder(
-                root, text, self.log, convert_sound(snd) if snd else None), need_device=False)
-
-    def choose_sound(self):
-        path = filedialog.askopenfilename(title='Startup sound', filetypes=[('WAV sound', '*.wav'), ('all files', '*')])
-        if not path:
-            return
-        try:
-            data = convert_sound(path)
-        except Exception as e:
-            messagebox.showerror(APP, str(e)); return
-        self.sound_path.set(path)
-        self.log('Startup sound: %s (%.1f s on the camera)' % (path, (len(data) - 44) / 2.0 / SOUND_RATE))
-
-    def do_play_sound(self):
-        """Play the chosen sound (or the one on the card) with the camera's own player."""
-        snd = self.sound_path.get()
-
-        def task(adb):
-            if snd:
-                tmp = tempfile.mkdtemp()
-                try:
-                    p = os.path.join(tmp, 'startup.wav')
-                    open(p, 'wb').write(convert_sound(snd))
-                    adb.push(p, '/dev/cam/sound_test.wav')
-                finally:
-                    shutil.rmtree(tmp, ignore_errors=True)
-                f = '/dev/cam/sound_test.wav'
-            else:
-                f = '/mnt/extsd/cam/startup.wav'
-            out = adb.sh('[ -f %s ] && { /system/bin/startup_music %s 2>&1 & i=0; while [ $i -lt 15 ]; do '
-                         'tinymix -D 0 1 31 >/dev/null; i=$((i+1)); done; wait; }; rm -f /dev/cam/sound_test.wav'
-                         % (f, f))     # the player sets Line Volume 29: back to the maximum 31
-            if 'Error' in out:
-                raise RuntimeError('The camera could not play the sound:\n' + out.strip())
-            if 'Playing' not in out:
-                raise RuntimeError('No sound file: choose one, or write the SD card with one first.')
-            self.log('Played on the camera.')
-        self.run_task('Play the startup sound on the camera', task, usb_only=True)
+            self.run_task('Write SD card to %s' % root, lambda _: write_sd_folder(root, text, self.log),
+                          need_device=False)
 
 
 if __name__ == '__main__':

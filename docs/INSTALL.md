@@ -40,14 +40,19 @@ flash with the image and writes the backup back if they differ. It does not rebo
 ## 3. Prepare the SD card
 
 The card must be **FAT32** (64 GB cards come as exFAT: format the card in the camera's
-own menu). Copy `sdcard/cam` (with the built `bin/`) to the card root and edit
-`cam/config.txt`. Reboot the camera.
+own menu). Copy `sdcard/cam` (with the built `bin/`, see [BUILD.md](BUILD.md), or the
+`sdcard.zip` of a release) to the card root and edit `cam/config.txt`. Reboot the camera.
+With `ADMIN_PASSWORD` set, later changes can be made over WiFi (LamaxTool, or
+`ssh root@<ip>` / `scp -O`).
 
 ## Recovery
 
 * **Stock behaviour without touching the flash:** `MODE=stock` in `config.txt` or remove `cam/`.
 * **Original boot partition:** `.\boot\flash_boot.ps1 -Image "$out\mtdblock1.bin" -Backup "$out\mtdblock1.bin"`
-  (or LamaxTool → Restore original boot).
+  (or LamaxTool → Restore original boot). Without a backup of your own, `ORIGINAL_FW/` has
+  one untouched camera's dump – use its `mtdblock1_boot.bin` **only** if your camera's
+  `system` partition has the same SHA-256 as `ORIGINAL_FW/SHA256SUMS` lists (firmware
+  revisions differ between units; LamaxTool checks this by itself).
 * **Camera does not boot at all:** the bootloader (mtd0) is never written, so the
   Allwinner FEL USB mode is still available; with `sunxi-fel` the SPI flash can be
   rewritten from the backup. See the [linux-sunxi FEL documentation](https://linux-sunxi.org/FEL).

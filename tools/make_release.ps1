@@ -5,8 +5,8 @@ param([Parameter(Mandatory)] [string]$Version)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
-$need = 'camd', 'camui', 'camled', 'camnet', 'wpa_supplicant', 'wpa_cli'
-foreach ($b in $need) { if (-not (Test-Path "sdcard\cam\bin\$b")) { throw "sdcard\cam\bin\$b missing - run build.sh and third_party/build_wpa.sh" } }
+$need = 'camd', 'camui', 'camled', 'camnet', 'camcfg', 'dropbearmulti', 'wpa_supplicant', 'wpa_cli'
+foreach ($b in $need) { if (-not (Test-Path "sdcard\cam\bin\$b")) { throw "sdcard\cam\bin\$b missing - run build.sh, third_party/build_wpa.sh and third_party/build_dropbear.sh" } }
 
 $out = Join-Path $root "dist\release-$Version"
 if (Test-Path $out) { Remove-Item -Recurse -Force $out }

@@ -143,6 +143,20 @@ CAMCFG=
 [ -n "$(get ADMIN_PASSWORD)" ] && CAMCFG_ON=1 || CAMCFG_ON=0
 if [ $CAMCFG_ON = 1 ]; then $RUN/camcfg $CFG & CAMCFG=$!; fi
 
+# --- SSH (Dropbear): user root, password = ADMIN_PASSWORD; off without one -------
+# The host key is made once and kept on the card, so the fingerprint stays the same.
+SSHD=
+start_ssh() { $RUN/dropbearmulti dropbear -F -E -p 22 -r $SD/ssh/ed25519_host_key & SSHD=$!; }
+if [ $CAMCFG_ON = 1 ] && [ -f $RUN/dropbearmulti ]; then
+    # dropbearmulti takes its role as the first argument; only scp must exist under its own
+    # name (clients run "scp -t ..."), and there is no `ln` on the camera: one copy (RAM)
+    cp $RUN/dropbearmulti $RUN/scp && chmod 755 $RUN/scp
+    umask 077; get ADMIN_PASSWORD > $RUN/ssh.pw; umask 022
+    mkdir -p $SD/ssh
+    [ -s $SD/ssh/ed25519_host_key ] || $RUN/dropbearmulti dropbearkey -t ed25519 -f $SD/ssh/ed25519_host_key
+    start_ssh
+fi
+
 # --- battery charge limit -------------------------------------------------
 # The AXP209 charger has no percentage limit of its own, so switch charging
 # The AXP209 charger has no percentage limit, and the axp driver switches
@@ -183,21 +197,6 @@ ntp_sync() {
     echo "$(ts) $OUT"
 }
 
-# --- own startup sound: cam/startup.wav once the camera is on the network ------
-# Played with the camera's own startup_music player (16-bit PCM WAV; LamaxTool
-# converts any WAV to 22050 Hz mono). STARTUP_SOUND=0 turns it off. The original
-# sound at power-on comes from the stock firmware before this script runs.
-SOUND_DONE=0
-ready_sound() {
-    [ $SOUND_DONE = 0 ] || return
-    SOUND_DONE=1
-    if [ "$(get STARTUP_SOUND 1)" = "1" ] && [ -f $SD/startup.wav ]; then
-        /system/bin/startup_music $SD/startup.wav >/dev/null 2>&1 &
-        # the player sets the speaker level (Line Volume) to 29: back to the maximum 31
-        i=0; while [ $i -lt 15 ]; do tinymix -D 0 1 31 >/dev/null 2>&1; i=$((i + 1)); done
-    fi
-}
-
 # --- supervisor -----------------------------------------------------------
 alive() { [ -n "$1" ] && [ -d /proc/$1 ]; }
 LINKED=0
@@ -233,6 +232,10 @@ while true; do
         $RUN/camcfg $CFG &
         CAMCFG=$!
     fi
+    if [ -n "$SSHD" ] && ! alive $SSHD; then
+        echo "$(ts) dropbear exited, restarting"
+        start_ssh
+    fi
     if [ ! -S $RUN/wpa/wlan0 ]; then
         echo "$(ts) wpa_supplicant not running, restarting"
         start_wpa
@@ -252,7 +255,6 @@ while true; do
         if [ "$IPLOGGED" = 0 ] && $RUN/camnet show wlan0 > $RUN/ip.txt 2>&1; then
             echo "$(ts) $(cat $RUN/ip.txt)"
             IPLOGGED=1
-            ready_sound
         fi
         [ "$IPLOGGED" = 1 ] && [ $LOOPS -ge $NTP_NEXT ] && ntp_sync
     elif [ $LINKED = 1 ]; then

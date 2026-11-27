@@ -32,6 +32,7 @@ wpa_log.txt
 # --- local settings that may hold WiFi or RTSP passwords ---------------------
 config.local.txt
 LamaxTool_settings.txt
+LamaxTool_known_hosts
 *.local.txt
 
 # --- editors / OS ------------------------------------------------------------

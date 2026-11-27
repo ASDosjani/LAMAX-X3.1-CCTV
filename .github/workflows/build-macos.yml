@@ -37,6 +37,8 @@ jobs:
         run: bash third_party/build_wpa.sh
       - name: Build camera programs
         run: bash build.sh
+      - name: Build Dropbear (SSH)
+        run: bash third_party/build_dropbear.sh
       - uses: actions/upload-artifact@v4
         with:
           name: camera-bin

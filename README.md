@@ -8,9 +8,10 @@ WiFi security camera: after power-on it joins your WiFi and serves an
 * The camera needs **one small, one-time change** in its flash: a boot hook in the
   boot partition that starts `cam/autorun.sh` if it exists on the SD card.
   Without that folder (or with `MODE=stock`) the camera works exactly like before.
-* A desktop tool (**LamaxTool**, Windows and Linux) backs up the flash, installs the
+* A desktop tool (**LamaxTool**, Windows, Linux and macOS) backs up the flash, installs the
   hook and prepares SD cards – with a WiFi scan to pick the network – so many
-  cameras can be converted quickly.
+  cameras can be converted quickly. Once a camera runs this software, everything also
+  works **over WiFi** (with an admin password), including talking through the camera.
 
 > ⚠️ This modifies your camera's firmware. A full flash backup is made first and
 > the write is verified by reading it back, but you do this at your own risk.
@@ -23,7 +24,8 @@ WiFi security camera: after power-on it joins your WiFi and serves an
 |---|---|
 | Video | 2688×1520 (2.7K), 1920×1080 or 1280×720, 1–30 fps, H.264 baseline/main/high, hardware encoder (≈13 ms per 1080p frame, ≈27 ms at 2688×1520) |
 | Audio | optional: built-in microphone as a second track, G.711 µ-law (PCMU) 8 kHz, in sync with the video |
-| Intercom | LamaxTool **🎤 Talk**: the computer's microphone plays on the camera's speaker (16 kHz, encrypted, ~0.2–0.3 s delay) |
+| Intercom | LamaxTool **🎤 Talk**: the computer's microphone plays on the camera's speaker (16 kHz, encrypted, ~0.2–0.3 s delay); together with the microphone track it works both ways at once |
+| Management | LamaxTool over USB or over WiFi: settings (encrypted), status, WiFi scan, reboot, flash backup / boot hook / SD card update through SSH; SSH shell (Dropbear) |
 | RTSP | `rtsp://<ip>:554/stream`, RTP over UDP or TCP (interleaved), optional Digest login (like Hikvision), up to 8 clients |
 | Network | 2.4 GHz WiFi, WPA2-PSK or open, DHCP or static IP, automatic reconnect |
 | Time stamp | date and time burned into the picture (optionally with the camera name, and the battery percentage while there is no external power), any corner; time from the network (SNTP), POSIX time zone |
@@ -57,7 +59,7 @@ WiFi security camera: after power-on it joins your WiFi and serves an
    2. **Install boot hook** – built from *this* camera's own backup, written, read back and compared.
    The window has three numbered sections: **1 Camera flash** (once per camera),
    **2 Settings** (edit / open / save `config.txt`) and **3 Write to SD card**.
-   3. Set up the camera on the **Network / Video / Time / RTSP / Device** tabs – every
+   3. Set up the camera on the **Network / Video / Time / RTSP / Remote / Device** tabs – every
       `config.txt` setting is there, with range checks. **Scan WiFi w. camera** lists the
       networks the camera sees (see below), so the name can be picked instead of typed. Settings can be loaded from a `config.txt` file or straight from the
       camera's SD card, saved to a file (e.g. as a template for more cameras) or reset to defaults.
@@ -82,12 +84,14 @@ Manual installation without the tool: [docs/INSTALL.md](docs/INSTALL.md).
 Set an **admin password** on the tool's 🌐 Remote tab (`ADMIN_PASSWORD`, at least 8
 characters, not the RTSP password) and write the SD card once over USB. After the camera
 restarts, choose **📶 WiFi** at the top of LamaxTool and enter the camera's IP (with the
-camera on USB, **Get stream link** fills it in). Then these work without a cable:
-**Read from camera**, **Write to camera SD card** (only `config.txt`; it offers to restart
-the camera), **⏻ Reboot camera**, **Scan WiFi w. camera**, **Get stream link**, and
-**⟳ Refresh** shows name, resolution, battery and uptime.
-Updating the camera programs, flash backup and the boot hook still need USB (or a card
-reader for the programs).
+camera on USB, **Get stream link** fills it in). Then **every function works without a
+cable**: settings, WiFi scan, stream link, reboot, status and 🎤 Talk go through the
+configuration service; flash backup, boot hook, restore and **Write to camera
+SD card** (programs and `config.txt`, like over USB; it offers to restart the
+camera) go through SSH (below). A camera whose programs do not have SSH yet gets only its
+`config.txt` written over WiFi; write it once over USB. The camera's SSH key is remembered
+in `LamaxTool_known_hosts` next to the program; if it changes, the tool refuses to connect.
+Flashing over WiFi keeps going even if the connection drops; do not switch the camera off.
 
 Security: the camera runs a small HTTP service (`camcfg`, port `ADMIN_PORT`, default 8080)
 only when an admin password is set. Logins use HTTP Digest (the password itself is never
@@ -109,17 +113,35 @@ With the camera configured over WiFi (admin password set, **📶 WiFi** chosen a
 **🎤 Talk** in LamaxTool sends the computer's microphone to the camera's speaker until
 **⏹ Stop talking** is pressed; the status line shows the level. The sound is 16 kHz mono,
 about 0.2–0.3 s behind, and encrypted (ChaCha20, key from the admin password and a one-time
-token). LamaxTool raises a quiet laptop microphone automatically (up to +20 dB). If the
-camera can be heard by the computer's microphone (same room) the loop starts to howl: a
-guard turns the gain down within ~1 s, but keep them apart or use a headset. One person
-at a time; it is one-way (listen with the stream's microphone track, `AUDIO=1`).
+token). **mic gain** next to the button: *Auto* raises a quiet laptop microphone by up to
++30 dB (it does not turn up during silence), or choose a fixed +6 … +36 dB. If the camera
+can be heard by the computer's microphone (same room) the loop starts to howl: a guard
+halves the gain within ~1 s while it lasts, but keep them apart or use a headset.
+One person talks at a time; with the stream's microphone track (`AUDIO=1`) the camera's
+side is heard at the same time, so it works both ways like a phone call.
 On Linux the microphone needs PortAudio (`sudo apt install libportaudio2`).
+
+### SSH
+
+With an admin password set, the camera also runs an SSH server (Dropbear, port 22):
+
+```
+ssh root@<camera ip>                       # password: the admin password
+scp -O file.txt root@<camera ip>:/mnt/extsd/cam/
+```
+
+It is a root shell (toolbox commands only: no busybox, `ls`, `cat`, `ps`, `getprop` style
+tools are there, `grep`/`ln`/`date` are not). It uses about 0.5 MB of RAM plus 0.6 MB for
+its program copies, and ~0.5 MB more per open session. Password login only, with a 1 s penalty per wrong
+password; the host key is made on first start and kept in `cam/ssh/` on the card, so the
+fingerprint stays the same. Use `scp -O` (the classic protocol): newer OpenSSH clients use
+SFTP by default, which this build has no server for. Without an admin password SSH is off.
 
 ### WiFi scan in LamaxTool
 
 **Scan WiFi w. camera** uses the camera's own radio, so it needs a camera that already
-runs this software (boot hook installed, SD card written, camera restarted) and is
-connected over USB. The list shows each network's signal in dBm – the most accurate
+runs this software (boot hook installed, SD card written, camera restarted), connected
+over USB or reached over WiFi. The list shows each network's signal in dBm – the most accurate
 picture of what the camera will see where it is. The networks the camera already knows
 appear at once; three fresh scans (about 3 s each – a single scan catches only part of
 the networks) are added to the list as they finish. For the very first setup simply type
@@ -127,20 +149,23 @@ the network name.
 
 ## Security notes
 
-* **Put the cameras on a separate guest / IoT WiFi network.** The WiFi password is
-  stored in clear text in `cam/config.txt`, and anyone holding the camera can read
-  everything on it anyway (adb gives a root shell without a password – that is how
-  the stock firmware ships). A guest network keeps a stolen camera from being a
+* **Put the cameras on a network of their own** (an IoT network or VLAN, shared only with
+  the NVR / PC that records them – not a guest WiFi that visitors use). The WiFi password
+  is stored in clear text in `cam/config.txt`, and anyone holding the camera can read
+  everything on it anyway (adb over USB gives a root shell without a password – that is
+  how the stock firmware ships). A separate network keeps a stolen camera from being a
   key to your home network.
 * **Set `RTSP_USER` / `RTSP_PASSWORD`** – otherwise anyone on the camera's network can open
   the stream with just the IP address. The login works like on Hikvision cameras: Digest
   only (no Basic, the password never travels readably), a fresh challenge for every login
   that is used up by it (a recorded login cannot be replayed), 1 s penalty per wrong
   password. Like on practically every IP camera, the **video itself is not encrypted**:
-  someone who records the traffic can still watch it. Give the cameras a network of their
-  own (or one shared only with the NVR / PC that records them).
+  someone who records the traffic can still watch it.
+* **Use a long random admin password** and never forward ports 8080 or 22 to the internet:
+  the admin password opens the configuration service and a root SSH shell.
 * There is no ONVIF and no web interface; only RTSP (TCP 554, UDP 6970/6971, audio 6972/6973) is served,
-  plus – only with an `ADMIN_PASSWORD` – the configuration service for LamaxTool (TCP 8080).
+  plus – only with an `ADMIN_PASSWORD` – the configuration service for LamaxTool (TCP 8080)
+  and SSH (TCP 22, user root, the admin password).
 
 ## Configuration
 
@@ -157,18 +182,21 @@ Windows line endings are fine). The file is self-documenting; the main keys:
 | `VIDEO_GOP_SECONDS`, `VIDEO_PROFILE`, `VIDEO_FLIP` | 2 / main / 0 | flip = rotate 180° |
 | `RTSP_PORT`, `RTSP_PATH`, `RTSP_USER`, `RTSP_PASSWORD` | 554 / stream | empty user = no login; Digest login otherwise (see Security) |
 | `AUDIO`, `AUDIO_GAIN` | 0 / 7 | 1 = microphone as a second RTSP track (G.711 µ-law 8 kHz, 64 kbit/s, raw – no noise reduction); gain 0–7 |
-| `ADMIN_PASSWORD`, `ADMIN_PORT` | empty / 8080 | configuration over WiFi with LamaxTool (user `admin`); empty = off, USB only. At least 8 characters, different from the RTSP password; long and random is best |
+| `ADMIN_PASSWORD`, `ADMIN_PORT` | empty / 8080 | configuration over WiFi with LamaxTool (user `admin`) and SSH (user `root`, port 22); empty = both off, USB only. At least 8 characters, different from the RTSP password; long and random is best |
 | `OSD_TIME`, `OSD_POSITION`, `OSD_NAME` | 1 / top-left / 0 | date and time in the picture, corner, camera name in front of it |
 | `OSD_BATTERY` | 1 | `BAT 87%` after the time while running from the battery (nothing on external power) |
 | `TIMEZONE` | `CET-1CEST,M3.5.0,M10.5.0/3` | POSIX TZ string (examples in `config.txt`; LamaxTool has a list) |
 | `NTP_SERVER` | `pool.ntp.org` | time server; the WiFi router is tried as well. Synced after WiFi connects, then every 6 h |
 | `SCREEN_TIMEOUT` | 60 | seconds; 0 = always on |
-| `STARTUP_SOUND` | 1 | play `cam/startup.wav` once the camera is on the network (LamaxTool: Device tab → *Startup sound*, any PCM WAV, converted to 22050 Hz mono, max. 10 s, made as loud as possible; the speaker is set to its maximum while it plays). The original power-on sound comes from the stock firmware and stays |
 | `LED` | `on` | `off` = status LEDs off |
 | `BATTERY_LONG_LIFE` | 1 | charge only to 4.10 V (≈ 85–90 %) and, on battery, power off at 10 % / 3.45 V (it starts again when external power returns); 0 = full charge, run until empty |
 | `WATCHDOG` | 1 | reboot if the stream program hangs |
 | `LOG` | `off` | `sd` = `cam/log.txt` (max 2 × 512 KB, rotated while running), `ram` = RAM only, nothing written to the card, `off` |
 | `WIFI_DEBUG_LOG` | 0 | verbose `cam/wpa_log.txt` (max 2 × 1 MB) |
+
+WiFi power saving is always switched off: with it the link becomes slow and lossy
+(~200 ms, streams stall) for a negligible saving.
+
 ## Screen and buttons
 
 * **Status page:** network name, signal strength in dBm with bars and a rating
@@ -208,9 +236,10 @@ The red LED is the charger chip's own indicator (blinks while charging) and cann
 ```
 cam/autorun.sh      started by the boot hook; starts and supervises everything
 cam/config.txt      settings
-cam/bin/            camd (stream), camui (screen), camled (LEDs), camnet (network helper),
-                    camcfg (configuration over WiFi), wpa_supplicant + wpa_cli
-cam/startup.wav     own startup sound (optional, STARTUP_SOUND=1)
+cam/bin/            camd (stream, microphone), camui (screen), camled (LEDs), camnet (network
+                    helper), camcfg (configuration over WiFi, intercom), dropbearmulti (SSH),
+                    wpa_supplicant + wpa_cli
+cam/ssh/            SSH host key (made on first start; keeps the fingerprint)
 cam/log.txt         log, only with LOG=sd (rotated at 512 KB while running, previous part in log.txt.old)
 cam/wifi_scan.txt   last WiFi scan
 ```
@@ -222,6 +251,11 @@ cam/wifi_scan.txt   last WiFi scan
   own menu). Set `LOG=sd` and look at `cam/log.txt`.
 * **No WiFi:** only 2.4 GHz is supported; WPA3-only networks do not work (WPA2/WPA3
   mixed mode does). Set `WIFI_DEBUG_LOG=1` and check `cam/wpa_log.txt`.
+* **Stream freezes or the player disconnects:** usually the WiFi link (busy access point,
+  roaming between access points, weak signal – check the dBm on the status page). Lower the
+  resolution / bitrate (1080p at 3000 kbit/s carries much more reliably than 2688×1520 at
+  5000), and use **TCP** in the player or NVR (VLC: RTSP over TCP): lost packets are then
+  resent instead of freezing the picture.
 * **Back to stock:** set `MODE=stock`, remove the `cam` folder, or restore the boot
   partition with LamaxTool (**Restore original boot**). The tool uses the camera's own
   backup, or – for a camera without one – the reference dump in `ORIGINAL_FW/` (an
@@ -237,10 +271,11 @@ cam/wifi_scan.txt   last WiFi scan
 
 ## Documentation
 
-* [docs/BUILD.md](docs/BUILD.md) – building the camera programs, wpa_supplicant and LamaxTool.exe
+* [docs/BUILD.md](docs/BUILD.md) – building the camera programs, wpa_supplicant, Dropbear and
+  LamaxTool (Windows, Linux, macOS)
 * [docs/INSTALL.md](docs/INSTALL.md) – manual installation with adb, recovery
 * [docs/HARDWARE.md](docs/HARDWARE.md) – what was found out about the camera (flash layout,
-  display, LEDs, encoder, quirks)
+  sensor modes, encoder, sound, WiFi, display, LEDs, power, quirks)
 
 ## Repository layout
 
@@ -250,8 +285,11 @@ cam/wifi_scan.txt   last WiFi scan
 | `src/debug/` | small probing tools used while reverse engineering |
 | `sdcard/cam/` | `autorun.sh`, `config.txt` template (`bin/` is filled by `build.sh`) |
 | `boot/` | boot hook (`init.camsd.sh`), image builder (`make_boot.py`), PowerShell flasher |
-| `tools/` | LamaxTool (Python/tkinter, Windows + Linux) and its build scripts |
-| `third_party/` | wpa_supplicant build script (source is downloaded from w1.fi) |
+| `tools/` | LamaxTool (Python/tkinter, Windows + Linux + macOS) and its build scripts |
+| `third_party/` | build scripts for wpa_supplicant and Dropbear (sources are downloaded and checked by SHA-256) |
+| `dist/` | ready-built LamaxTool for Windows and Linux (committed) |
+| `ORIGINAL_FW/` | flash dump of an untouched camera, for restoring the boot partition |
+| `.github/workflows/` | builds the camera programs and the macOS app on GitHub |
 
 ## License
 
@@ -265,4 +303,11 @@ This project is licensed under the **GNU General Public License v2.0** – see [
 * `src/font8x16.h` – VGA 8×16 font from the Linux kernel (`lib/fonts/font_8x16.c`), GPL-2.0.
 * wpa_supplicant 2.10 – BSD license, © Jouni Malinen and contributors; built from the
   unmodified release tarball (only a build-time header shim).
+* Dropbear 2026.94 – MIT-style license, © Matt Johnston and contributors; built from the
+  release tarball with small patches for Android (password check against the admin password,
+  terminals, environment), see `third_party/build_dropbear.sh`.
+* Bundled into LamaxTool by PyInstaller: Python and tkinter, `paramiko` (LGPL-2.1, SSH client)
+  with `cryptography`, `bcrypt`, `PyNaCl` (Apache-2.0 / BSD), `sounddevice` (MIT) with PortAudio
+  (MIT) on Windows and macOS.
+* `ORIGINAL_FW/` – LAMAX's own firmware, published for recovery purposes only.
 * LAMAX is a trademark of its owner. This project is not affiliated with LAMAX or Allwinner.

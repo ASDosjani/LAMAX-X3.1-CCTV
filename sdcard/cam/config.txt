@@ -12,7 +12,7 @@ CAMERA_NAME=camera1
 
 # --- WiFi (2.4 GHz networks only!) ------------------------------------------
 # WPA2-PSK (8..63 characters) or empty for an open network. The password is
-# stored in clear text: put the cameras on a separate guest / IoT network.
+# stored in clear text: put the cameras on a network of their own (IoT / VLAN).
 WIFI_SSID=
 WIFI_PASSWORD=
 
@@ -63,7 +63,8 @@ AUDIO_GAIN=7
 
 # --- Wireless configuration (LamaxTool over WiFi) -------------------------------
 # With a password, LamaxTool can read/write these settings, scan WiFi and restart
-# the camera over the network (user name: admin). Empty = off (USB only).
+# the camera over the network (user name: admin), and SSH is on (port 22, user root,
+# same password). Empty = both off (USB only).
 # Use a long random password: anyone with it can change everything.
 ADMIN_PASSWORD=
 ADMIN_PORT=8080
@@ -92,12 +93,6 @@ NTP_SERVER=pool.ntp.org
 # The screen (and its backlight) turns off after this many seconds
 # (0 = always on). Any button shows it again for the same time.
 SCREEN_TIMEOUT=60
-
-# --- Sound ------------------------------------------------------------------
-# 1 = play cam/startup.wav once the camera is on the network (16-bit PCM WAV,
-# e.g. 22050 Hz mono; LamaxTool converts any WAV). No file = no sound.
-# The original sound at power-on is part of the stock firmware and stays.
-STARTUP_SOUND=1
 
 # --- LEDs -------------------------------------------------------------------
 # on  = the blue and the top yellow LED show the state:

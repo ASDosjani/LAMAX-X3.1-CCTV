@@ -13,7 +13,7 @@ python3 -c 'import tkinter' 2>/dev/null || { echo "python3 has no tkinter (brew 
 ARCH=$(uname -m)
 VENV=${VENV:-$HOME/.cache/lamaxtool-venv}
 [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
-"$VENV/bin/python" -m pip install --quiet --upgrade pip pyinstaller sounddevice
+"$VENV/bin/python" -m pip install --quiet --upgrade pip pyinstaller sounddevice paramiko
 # own output folder: dist/LamaxTool is the committed Linux binary
 OUT=build/macos-dist
 rm -rf "$OUT" dist/LamaxTool.app

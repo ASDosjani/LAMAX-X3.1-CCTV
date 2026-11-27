@@ -27,4 +27,5 @@ build camtest src/camtest.c src/v4l2cap.c src/h264enc.c
 # assemble the SD card folder: sdcard/cam/bin
 mkdir -p sdcard/cam/bin
 for b in camd camui camnet camled camcfg wpa_supplicant wpa_cli; do [ -f out/$b ] && cp out/$b sdcard/cam/bin/; done
+# dropbearmulti (SSH) comes from third_party/build_dropbear.sh
 ls -la out sdcard/cam/bin
