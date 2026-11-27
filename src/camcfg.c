@@ -9,6 +9,10 @@
  *   POST /api/reboot     restart the camera
  *   GET  /api/wifi       wpa_supplicant scan results (bssid freq dBm flags ssid)
  *   POST /api/wifi/scan  start a new scan (results ~1-3 s later)
+ *   GET  /api/talk       intercom: a one-time talk token (sealed), valid 30 s
+ *   TALK /api/talk       (header X-Talk-Token, no Digest) then a stream of 16 kHz mono
+ *                        s16le sound, ChaCha20-encrypted with HMAC(master, "talk"+token),
+ *                        played on the speaker until the connection closes
  *
  * usage: camcfg <config.txt>
  * Every nonce is used once per request counter (nc), lives 5 minutes, and a
@@ -16,6 +20,7 @@
  * A failed login costs 1 s. The config.txt contents (with the WiFi, RTSP and admin
  * passwords) travel encrypted in both directions (seal.h: ChaCha20 + HMAC-SHA256,
  * key from the admin password); status and WiFi scan results are plain. */
+#include "alsa.h"
 #include "config.h"
 #include "log.h"
 #include "md5.h"
@@ -52,6 +57,16 @@ static char g_pass[128];
 static uint8_t g_master[32];            /* envelope key, derived from the admin password */
 
 static struct { char v[33]; time_t born; unsigned nc; } nonces[NONCES];
+
+/* intercom */
+#define TALK_RATE   16000
+#define TALK_PERIOD 320                 /* frames = 20 ms */
+#define TALK_CHUNK  (TALK_PERIOD * 2)   /* bytes per chunk = 10 ChaCha20 blocks */
+#define TALK_TTL    30
+static uint8_t g_talk_token[16];
+static time_t g_talk_born;              /* 0 = no token outstanding */
+static pid_t g_talk_pid;                /* child playing, 0 = none */
+static int g_listen = -1;               /* closed in the talk child */
 
 static uint32_t rnd32(void)
 {
@@ -298,6 +313,100 @@ static void scan_wifi(int fd)
     reply_text(fd, 200, "OK", r[0] ? r : "OK\n");
 }
 
+/* ------------------------------------------------------------------ intercom */
+
+static int talking(void)
+{
+    return g_talk_pid > 0 && kill(g_talk_pid, 0) == 0;   /* SIGCHLD ignored: no zombies */
+}
+
+static void get_talk(int fd)
+{
+    if (talking()) { reply_text(fd, 409, "Conflict", "someone is already talking\n"); return; }
+    int u = open("/dev/urandom", O_RDONLY);
+    if (u < 0 || read(u, g_talk_token, sizeof(g_talk_token)) != (ssize_t)sizeof(g_talk_token)) {
+        if (u >= 0) close(u);
+        reply_text(fd, 500, "Error", "no random numbers\n");
+        return;
+    }
+    close(u);
+    g_talk_born = mono();
+    uint8_t out[sizeof(g_talk_token) + SEAL_OVERHEAD];
+    size_t n = seal(g_master, g_talk_token, sizeof(g_talk_token), out, time(NULL));
+    reply(fd, 200, "OK", "X-Lamax-Sealed: 1\r\n", (const char *)out, n);
+}
+
+static int hexval(int c) { return c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'f' ? (c | 32) - 'a' + 10 : -1; }
+
+/* child process: decrypt the stream and play it until the connection ends */
+static void talk_play(int fd, const uint8_t key[32], const uint8_t *pre, size_t prelen)
+{
+    static const uint8_t zero_nonce[12];
+    struct timeval tv = { 3, 0 };                         /* 3 s without sound: end */
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    alsa_mixer_set(0, "Speaker Function", 1);             /* must be written before every open */
+    alsa_mixer_set(0, "Audio speaker out", 1);
+    alsa_mixer_set(0, "Line Volume", 31);
+    alsa_t a;
+    /* 40 ms x 4 periods = 160 ms of buffer against WiFi jitter (20 ms x 8 is rejected) */
+    if (alsa_open(&a, 0, 0, 0, TALK_RATE, 1, 2 * TALK_PERIOD, 4) < 0) {
+        LOGE("talk: speaker: %s", a.err);
+        return;
+    }
+    LOGI("talk: playing");
+    uint8_t buf[TALK_CHUNK];
+    size_t have = prelen < sizeof(buf) ? prelen : sizeof(buf);
+    memcpy(buf, pre, have);
+    uint32_t counter = 1;
+    size_t total = 0;
+    for (;;) {
+        while (have < sizeof(buf)) {
+            ssize_t r = recv(fd, buf + have, sizeof(buf) - have, 0);
+            if (r <= 0) goto done;
+            have += (size_t)r;
+        }
+        chacha20_xor(key, zero_nonce, counter, buf, sizeof(buf));
+        counter += TALK_CHUNK / 64;
+        if (alsa_write(&a, (int16_t *)buf, TALK_PERIOD) < 0) { LOGW("talk: %s", a.err); break; }
+        total += TALK_PERIOD;
+        have = 0;
+    }
+done:
+    alsa_close(&a);                                       /* plays out what is buffered */
+    alsa_mixer_set(0, "Audio speaker out", 0);
+    LOGI("talk: ended after %.1f s", total / (double)TALK_RATE);
+}
+
+static void talk_session(int fd, const char *req, const uint8_t *pre, size_t prelen)
+{
+    char tok[64];
+    uint8_t t[16];
+    int ok = hdr(req, "X-Talk-Token", tok, sizeof(tok)) && strlen(tok) == 32 && g_talk_born &&
+             mono() - g_talk_born <= TALK_TTL;
+    for (int i = 0; ok && i < 16; i++) {
+        int h = hexval(tok[2 * i]), l = hexval(tok[2 * i + 1]);
+        if (h < 0 || l < 0) ok = 0; else t[i] = (uint8_t)(h << 4 | l);
+    }
+    uint8_t diff = 0;
+    for (int i = 0; ok && i < 16; i++) diff |= t[i] ^ g_talk_token[i];
+    if (!ok || diff || talking()) {
+        LOGW("talk: refused (bad or expired token, or busy)");
+        sleep(1);
+        reply_text(fd, 403, "Forbidden", "talk token invalid or expired\n");
+        return;
+    }
+    g_talk_born = 0;                                      /* single use */
+    uint8_t key[32], m[4 + 16];
+    memcpy(m, "talk", 4); memcpy(m + 4, t, 16);
+    hmac_sha256(g_master, 32, m, sizeof(m), key);
+    const char *ok_resp = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n";
+    send_all(fd, ok_resp, strlen(ok_resp));
+    pid_t p = fork();
+    if (p == 0) { close(g_listen); talk_play(fd, key, pre, prelen); _exit(0); }
+    if (p > 0) g_talk_pid = p;
+    memset(key, 0, sizeof(key));
+}
+
 /* ------------------------------------------------------------------ server */
 
 static void handle(int fd)
@@ -319,6 +428,13 @@ static void handle(int fd)
 
     char method[8], target[256];
     if (sscanf(req, "%7s %255s", method, target) != 2) { reply_text(fd, 400, "Bad Request", "bad request\n"); return; }
+
+    /* intercom stream: the one-time token is the authentication; sound bytes that
+     * arrived together with the header are handed over */
+    if (!strcmp(method, "TALK") && !strcmp(target, "/api/talk")) {
+        talk_session(fd, req, (const uint8_t *)extra, have);
+        return;
+    }
 
     char cl[24];
     size_t blen = hdr(req, "Content-Length", cl, sizeof(cl)) ? (size_t)strtoul(cl, NULL, 10) : 0;
@@ -355,6 +471,7 @@ static void handle(int fd)
     else if (!strcmp(method, "POST") && !strcmp(target, "/api/reboot")) do_reboot(fd);
     else if (!strcmp(method, "GET") && !strcmp(target, "/api/wifi")) get_wifi(fd);
     else if (!strcmp(method, "POST") && !strcmp(target, "/api/wifi/scan")) scan_wifi(fd);
+    else if (!strcmp(method, "GET") && !strcmp(target, "/api/talk")) get_talk(fd);
     else reply_text(fd, 404, "Not Found", "unknown request\n");
 }
 
@@ -375,7 +492,7 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
 
-    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    int ls = g_listen = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));

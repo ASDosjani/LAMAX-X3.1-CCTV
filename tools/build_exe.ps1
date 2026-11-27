@@ -10,8 +10,8 @@ $venv = Join-Path $env:TEMP 'lamaxtool-venv'
 if (-not (Test-Path "$venv\Scripts\python.exe")) { python -m venv $venv }
 # PyInstaller logs to stderr; Windows PowerShell 5 would treat that as an error
 $ErrorActionPreference = 'Continue'
-& "$venv\Scripts\python.exe" -m pip install --quiet --upgrade pip pyinstaller
-& "$venv\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed --name LamaxTool `
+& "$venv\Scripts\python.exe" -m pip install --quiet --upgrade pip pyinstaller sounddevice
+& "$venv\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed --name LamaxTool --exclude-module numpy `
     --distpath dist --workpath build\pyinstaller --specpath build `
     --add-data "$root\boot\make_boot.py;boot" `
     --add-data "$root\boot\init.camsd.sh;boot" `

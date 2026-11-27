@@ -151,6 +151,117 @@ def seal_open(master, data, now):
     return _chacha20_xor(enc, bytes(12), 1, data[28:-32])
 
 
+class Talker:
+    """Intercom: the laptop microphone -> the camera's speaker. A one-time token from
+    camcfg (GET /api/talk, sealed), then a raw connection carrying 16 kHz mono s16le
+    in 20 ms chunks, ChaCha20-encrypted with HMAC(master, "talk" + token)."""
+    RATE, BLOCK = 16000, 320            # 20 ms; one chunk = 640 bytes = 10 ChaCha20 blocks
+
+    def __init__(self, net, on_level=None, gain_db=None):
+        """gain_db: None = automatic, else a fixed microphone gain in dB."""
+        self.net, self.on_level = net, on_level
+        self.fixed = None if gain_db is None else 10 ** (gain_db / 20.0)
+        self.running = False
+        self.sock = self.stream = None
+
+    def start(self):
+        import hmac, queue as _q, socket
+        try:
+            import sounddevice as sd
+        except Exception as e:          # ImportError, or OSError when PortAudio is missing (Linux)
+            raise RuntimeError('No microphone support in this build (%s). On Linux install '
+                               'libportaudio2 (sudo apt install libportaudio2).' % e)
+        raw = self.net.request('GET', '/api/talk')
+        if raw.startswith(b'someone'):
+            raise RuntimeError('Someone else is talking to this camera.')
+        token = seal_open(self.net._master(), raw, self.net._camera_now())
+        key = hmac.new(self.net._master(), b'talk' + token, hashlib.sha256).digest()
+        s = socket.create_connection((self.net.host, self.net.port), timeout=5)
+        s.sendall(b'TALK /api/talk HTTP/1.1\r\nX-Talk-Token: ' + token.hex().encode() + b'\r\n\r\n')
+        head = b''
+        while b'\r\n\r\n' not in head:
+            d = s.recv(1024)
+            if not d:
+                break
+            head += d
+        if not head.startswith(b'HTTP/1.1 200'):
+            s.close()
+            raise RuntimeError('The camera refused the talk connection: %s' % head.split(b'\r\n')[0].decode('latin-1'))
+        s.settimeout(None)
+        self.sock, self.key, self.q = s, key, _q.Queue(maxsize=50)
+        self.running = True
+
+        def callback(indata, frames, t, status):
+            try:
+                self.q.put_nowait(bytes(indata))
+            except _q.Full:              # network stalled: drop rather than build up delay
+                pass
+        self.stream = sd.RawInputStream(samplerate=self.RATE, channels=1, dtype='int16',
+                                        blocksize=self.BLOCK, callback=callback)
+        self.stream.start()
+        threading.Thread(target=self._send, daemon=True).start()
+
+    # automatic gain: laptop microphones are often quiet (-35 dBFS speech). Aim at about
+    # -13 dBFS RMS, up to +30 dB; quick to turn down, slow to turn up, and it does not turn
+    # up during silence (no hiss pumping). A tanh limiter keeps peaks from clipping.
+    # Fixed gain (gain_db): that gain, recovering to it after a howl cut.
+    # Howl guard: if the camera can be heard by the laptop microphone the loop starts to
+    # howl; speech has pauses, a howl does not - more than 1.2 s of uninterrupted loud
+    # output halves the gain (again and again while it lasts).
+    AGC_TARGET, AGC_MAX, AGC_SILENCE = 0.22, 31.6, 0.003
+    HOWL_LOUD, HOWL_CHUNKS = 0.08, 60
+
+    def _agc(self, data):
+        import array, math
+        a = array.array('h', data)
+        rms = math.sqrt(sum(v * v for v in a) / len(a)) / 32768.0
+        if self.fixed is not None:
+            self.gain = min(self.fixed, self.gain * 1.01)              # back to the set gain in ~1-2 s
+        elif rms > self.AGC_SILENCE:
+            want = min(self.AGC_MAX, max(1.0, self.AGC_TARGET / rms))
+            self.gain += (want - self.gain) * (0.5 if want < self.gain else 0.03)
+        self.loud = self.loud + 1 if rms * self.gain > self.HOWL_LOUD else 0
+        if self.loud > self.HOWL_CHUNKS:
+            self.gain = max(0.25, self.gain * 0.5)
+            self.loud = 0
+            self.howls += 1
+        g = self.gain
+        out = array.array('h', (int(32000 * math.tanh(v * g / 32000.0)) for v in a))
+        return out.tobytes(), rms
+
+    def _send(self):
+        chunk = self.BLOCK * 2
+        pending, counter, n = b'', 1, 0
+        self.gain, self.loud, self.howls = (self.fixed if self.fixed is not None else 4.0), 0, 0
+        try:
+            while self.running:
+                try:
+                    pending += self.q.get(timeout=0.5)
+                except Exception:
+                    continue
+                while len(pending) >= chunk:
+                    data, pending = pending[:chunk], pending[chunk:]
+                    data, rms = self._agc(data)
+                    self.sock.sendall(_chacha20_xor(self.key, bytes(12), counter, data))
+                    counter += chunk // 64
+                    n += 1
+                    if self.on_level and n % 12 == 0:            # ~4 times a second
+                        self.on_level(min(1.0, rms * self.gain))
+        except OSError:
+            pass
+        finally:
+            self.running = False
+
+    def stop(self):
+        self.running = False
+        for f in (lambda: self.stream.stop(), lambda: self.stream.close(),
+                  lambda: self.sock.shutdown(2), lambda: self.sock.close()):
+            try:
+                f()
+            except Exception:
+                pass
+
+
 class CamNet:
     """The camera over WiFi: camcfg's HTTP API (Digest login, user "admin",
     password ADMIN_PASSWORD). Only settings, reboot, WiFi scan and status -
@@ -467,8 +578,7 @@ SETTINGS = [
     ('Device', 'BATTERY_LONG_LIFE', 'Battery long life (charge to ~85-90 %, off at 10 %)', 'bool', ('1', '0')),
     ('Device', 'WATCHDOG', 'Reboot if the stream hangs', 'bool', ('1', '0')),
     ('Device', 'LOG', 'Log (sd / ram = not on the card / off)', 'choice', ['sd', 'ram', 'off']),
-    ('Device', 'WIFI_DEBUG_LOG', 'Detailed WiFi log (on the card)', 'bool', ('1', '0')),
-]
+    ('Device', 'WIFI_DEBUG_LOG', 'Detailed WiFi log (on the card)', 'bool', ('1', '0')),]
 # The camera has no time zone database: TIMEZONE is a POSIX TZ string.
 TIMEZONES = [
     ('UTC', 'UTC0'),
@@ -833,6 +943,8 @@ def rtsp_link(adb):
 
 # ----------------------------------------------------------------------------- GUI
 
+MIC_GAINS = ['Auto', '+6 dB', '+12 dB', '+18 dB', '+24 dB', '+30 dB', '+36 dB']   # intercom microphone
+
 TAB_ICONS = {'Network': '📶 ', 'Video': '🎥 ', 'Time': '🕒 ', 'RTSP': '📡 ',
              'Remote': '🌐 ', 'Device': '⚙ '}
 
@@ -882,6 +994,12 @@ class App(tk.Tk):
         ip_entry.pack(side='left', padx=(0, 6))
         ip_entry.bind('<Return>', lambda _e: (self.conn.set('wifi'), self.refresh()))
         ttk.Button(top, text='⟳ Refresh', command=self.refresh, style='Tool.TButton').pack(side='left')
+        self.talker = None
+        self.talk_btn = ttk.Button(top, text='🎤 Talk', command=self.toggle_talk, style='Tool.TButton')
+        self.talk_btn.pack(side='left', padx=(8, 2))
+        self.mic_gain = tk.StringVar(value='Auto')
+        ttk.Label(top, text='mic gain').pack(side='left')
+        ttk.Combobox(top, textvariable=self.mic_gain, values=MIC_GAINS, state='readonly', width=7).pack(side='left', padx=(2, 0))
         top2 = ttk.Frame(self); top2.pack(fill='x', padx=8)
         ttk.Label(top2, textvariable=self.status, style='Hint.TLabel').pack(side='left')
 
@@ -1124,7 +1242,8 @@ class App(tk.Tk):
             else:
                 self.cfg[key].set(d.get(key, ''))
         known = {k for _, k, _, _, _ in SETTINGS} | {'VIDEO_WIDTH', 'VIDEO_HEIGHT', 'LED_MODE', 'LED_STREAM', 'BATTERY_CHARGE_LIMIT',
-                                                     'LED_STATUS', 'LED_POWER', 'LED_INVERT'}
+                                                     'LED_STATUS', 'LED_POWER', 'LED_INVERT',
+                                                     'WIFI_POWER_SAVE'}   # removed setting: dropped
         self.extra_cfg = {k: v for k, v in values.items()       # kept when writing
                           if k not in known and not k.startswith('LAMAXTOOL_')}
         if values.get('LAMAXTOOL_CONNECTION') in ('usb', 'wifi'):
@@ -1133,6 +1252,8 @@ class App(tk.Tk):
             self.cam_ip.set(values['LAMAXTOOL_CAMERA_IP'])
         if 'LAMAXTOOL_STARTUP_SOUND' in values:
             self.sound_path.set(values['LAMAXTOOL_STARTUP_SOUND'])
+        if values.get('LAMAXTOOL_MIC_GAIN') in MIC_GAINS:
+            self.mic_gain.set(values['LAMAXTOOL_MIC_GAIN'])
 
     def form_values(self):
         """Current form content as KEY -> value (not validated)."""
@@ -1163,12 +1284,15 @@ class App(tk.Tk):
         v['LAMAXTOOL_CONNECTION'] = self.conn.get()
         v['LAMAXTOOL_CAMERA_IP'] = self.cam_ip.get().strip()
         v['LAMAXTOOL_STARTUP_SOUND'] = self.sound_path.get()
+        v['LAMAXTOOL_MIC_GAIN'] = self.mic_gain.get()
         try:
             save_last_settings(v)
         except OSError as e:
             self.log('Could not store the settings: %s' % e)
 
     def on_close(self):
+        if self.talker:
+            self.talker.stop()
         self.remember_now()
         self.after_cancel(self._pump_id)
         self.destroy()
@@ -1310,6 +1434,56 @@ class App(tk.Tk):
                 adb.run('reboot', check=False)
                 self.log('Camera is rebooting.')
         self.run_task('Reboot', task)
+
+    def toggle_talk(self):
+        """Intercom: laptop microphone -> camera speaker (over WiFi, admin password)."""
+        if self.talker:
+            self.talker.stop()
+            self.talker = None
+            self.talk_btn.configure(text='🎤 Talk')
+            self.status.set('Talking stopped')
+            self.log('Intercom: stopped')
+            return
+        if not self.wifi():
+            messagebox.showinfo(APP, 'Talking to the camera works over WiFi: choose "📶 WiFi" at the top, enter '
+                                     'the camera IP and its admin password (🌐 Remote tab).')
+            return
+        net = self.camnet()
+        if not net:
+            return
+        self.talk_btn.configure(text='… connecting')
+
+        def level(v):
+            bars = int(min(1.0, v * 6) * 10)
+            self.q.put(lambda: self.talker and self.status.set('🎤 Talking  ' + '▮' * bars + '▯' * (10 - bars)))
+
+        g = self.mic_gain.get()
+        gain_db = None if g == 'Auto' else float(g.split()[0])
+
+        def worker():
+            t = Talker(net, on_level=level, gain_db=gain_db)
+            try:
+                t.start()
+            except Exception as e:
+                msg = str(e)
+                self.log('Intercom: %s' % msg)
+                self.q.put(lambda: (self.talk_btn.configure(text='🎤 Talk'), messagebox.showerror(APP, msg)))
+                return
+            self._net_pw_ok = net.password
+            self.log('Intercom: talking to %s (the microphone of this computer -> camera speaker)' % net.host)
+
+            def started():
+                self.talker = t
+                self.talk_btn.configure(text='⏹ Stop talking')
+                self.after(500, watch)
+            self.q.put(started)
+
+        def watch():                     # connection lost on the way
+            if self.talker and not self.talker.running:
+                self.toggle_talk()
+            elif self.talker:
+                self.after(500, watch)
+        threading.Thread(target=worker, daemon=True).start()
 
     def open_backups(self):
         """Show the backups folder. On Windows explorer.exe directly: os.startfile (the

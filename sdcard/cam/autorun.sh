@@ -241,6 +241,9 @@ while true; do
     if [ "$STATE" = "COMPLETED" ]; then
         if [ $LINKED = 0 ]; then
             echo "$(ts) WiFi connected"
+            # the XR819 power saving makes the link slow and lossy (~200 ms, streams stall)
+            # for a negligible saving: always off, set after every (re)connection
+            echo "$(ts) $($RUN/camnet powersave wlan0 off)"
             apply_ip
             LINKED=1
             IPLOGGED=0

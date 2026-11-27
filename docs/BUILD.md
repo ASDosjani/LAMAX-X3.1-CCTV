@@ -13,7 +13,7 @@ Building on a plain Linux machine works the same way – skip the WSL part and r
 | `camui` | `build.sh` | camera | screen, buttons, WiFi scan page, battery/CPU/temperature |
 | `camled` | `build.sh` | camera | status LEDs |
 | `camd` audio | `src/audio.c`, `src/alsa.c` | camera | microphone → G.711 → RTSP track 2 (`AUDIO=1`) |
-| `camcfg` | `build.sh` | camera | configuration over WiFi for LamaxTool (HTTP + Digest, only with `ADMIN_PASSWORD`); `config.txt` encrypted with `src/seal.c` (SHA-256, HMAC, PBKDF2, ChaCha20 – checked against the FIPS 180 / RFC 4231 / RFC 8439 test vectors; LamaxTool has the same in Python) |
+| `camcfg` | `build.sh` | camera | configuration over WiFi for LamaxTool (HTTP + Digest, only with `ADMIN_PASSWORD`), and the intercom (`/api/talk`: one-time token, encrypted 16 kHz stream played with `src/alsa.c`; LamaxTool records the microphone with `sounddevice`/PortAudio, installed by the build scripts); `config.txt` encrypted with `src/seal.c` (SHA-256, HMAC, PBKDF2, ChaCha20 – checked against the FIPS 180 / RFC 4231 / RFC 8439 test vectors; LamaxTool has the same in Python) |
 | `camnet` | `build.sh` | camera | network helper for `autorun.sh` (static IP, config values, SNTP clock) |
 | `camtest` | `build.sh` | camera | capture + encode test (development only) |
 | `wpa_supplicant`, `wpa_cli` | `third_party/build_wpa.sh` | camera | WiFi client |

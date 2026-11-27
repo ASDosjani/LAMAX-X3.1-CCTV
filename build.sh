@@ -22,7 +22,7 @@ build camtest src/camtest.c src/v4l2cap.c src/h264enc.c
 [ -f src/camui.c ] && build camui src/camui.c src/fb.c src/wpactrl.c src/config.c
 [ -f src/camnet.c ] && build camnet src/camnet.c src/config.c src/wpactrl.c
 [ -f src/camled.c ] && build camled src/camled.c src/config.c src/wpactrl.c -lm
-[ -f src/camcfg.c ] && build camcfg src/camcfg.c src/config.c src/wpactrl.c src/md5.c src/seal.c
+[ -f src/camcfg.c ] && build camcfg src/camcfg.c src/config.c src/wpactrl.c src/md5.c src/seal.c src/alsa.c
 
 # assemble the SD card folder: sdcard/cam/bin
 mkdir -p sdcard/cam/bin

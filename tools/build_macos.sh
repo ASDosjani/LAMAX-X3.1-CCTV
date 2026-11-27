@@ -13,11 +13,11 @@ python3 -c 'import tkinter' 2>/dev/null || { echo "python3 has no tkinter (brew 
 ARCH=$(uname -m)
 VENV=${VENV:-$HOME/.cache/lamaxtool-venv}
 [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
-"$VENV/bin/python" -m pip install --quiet --upgrade pip pyinstaller
+"$VENV/bin/python" -m pip install --quiet --upgrade pip pyinstaller sounddevice
 # own output folder: dist/LamaxTool is the committed Linux binary
 OUT=build/macos-dist
 rm -rf "$OUT" dist/LamaxTool.app
-"$VENV/bin/python" -m PyInstaller --noconfirm --clean --onedir --windowed --name LamaxTool \
+"$VENV/bin/python" -m PyInstaller --noconfirm --clean --onedir --windowed --name LamaxTool --exclude-module numpy \
     --target-arch "$ARCH" --osx-bundle-identifier io.github.lamax-x31-cctv.lamaxtool \
     --distpath "$OUT" --workpath build/pyinstaller-macos --specpath build \
     --add-data "$ROOT/boot/make_boot.py:boot" \

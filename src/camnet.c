@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <linux/wireless.h>
 
 static int set_addr(int s, const char *ifn, unsigned long req, const char *ip)
 {
@@ -185,8 +186,29 @@ static int cmd_ntp(int argc, char **argv)
     return 1;
 }
 
+/* camnet powersave <iface> on|off: WiFi power management (wireless extensions).
+ * The XR819 sleeps between beacons with it on: ~200 ms ping, 30-60 % loss under load,
+ * the stream stalls. Off: ~20 ms, no loss (costs some battery). Prints the new state. */
+static int cmd_powersave(const char *ifname, const char *mode)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct iwreq w;
+    memset(&w, 0, sizeof(w));
+    strncpy(w.ifr_name, ifname, IFNAMSIZ - 1);
+    w.u.power.disabled = strcmp(mode, "on") != 0;
+    if (!w.u.power.disabled) w.u.power.flags = IW_POWER_ON;
+    int r = ioctl(fd, SIOCSIWPOWER, &w);
+    memset(&w.u, 0, sizeof(w.u));
+    if (r == 0) r = ioctl(fd, SIOCGIWPOWER, &w);
+    close(fd);
+    if (r < 0) { printf("wifi power save: %s\n", strerror(errno)); return 1; }
+    printf("wifi power save %s\n", w.u.power.disabled ? "off" : "on");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc >= 4 && !strcmp(argv[1], "powersave")) return cmd_powersave(argv[2], argv[3]);
     if (argc >= 3 && !strcmp(argv[1], "show")) {
         int s = socket(AF_INET, SOCK_DGRAM, 0);
         return show(s, argv[2]);
@@ -210,6 +232,6 @@ int main(int argc, char **argv)
         printf("%s\n", st[0] ? st : "NONE");
         return 0;
     }
-    fprintf(stderr, "usage: camnet static|show|get|wpaconf|state|ntp ...\n");
+    fprintf(stderr, "usage: camnet static|show|get|wpaconf|state|ntp|powersave ...\n");
     return 2;
 }

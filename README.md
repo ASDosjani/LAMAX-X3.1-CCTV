@@ -23,6 +23,7 @@ WiFi security camera: after power-on it joins your WiFi and serves an
 |---|---|
 | Video | 2688×1520 (2.7K), 1920×1080 or 1280×720, 1–30 fps, H.264 baseline/main/high, hardware encoder (≈13 ms per 1080p frame, ≈27 ms at 2688×1520) |
 | Audio | optional: built-in microphone as a second track, G.711 µ-law (PCMU) 8 kHz, in sync with the video |
+| Intercom | LamaxTool **🎤 Talk**: the computer's microphone plays on the camera's speaker (16 kHz, encrypted, ~0.2–0.3 s delay) |
 | RTSP | `rtsp://<ip>:554/stream`, RTP over UDP or TCP (interleaved), optional Digest login (like Hikvision), up to 8 clients |
 | Network | 2.4 GHz WiFi, WPA2-PSK or open, DHCP or static IP, automatic reconnect |
 | Time stamp | date and time burned into the picture (optionally with the camera name, and the battery percentage while there is no external power), any corner; time from the network (SNTP), POSIX time zone |
@@ -102,6 +103,18 @@ Do not forward the port to the internet.
 A changed admin password takes effect after the camera restarts. If new WiFi settings are
 wrong, the camera cannot come back on WiFi: fix them over USB.
 
+### Intercom: talk through the camera
+
+With the camera configured over WiFi (admin password set, **📶 WiFi** chosen at the top),
+**🎤 Talk** in LamaxTool sends the computer's microphone to the camera's speaker until
+**⏹ Stop talking** is pressed; the status line shows the level. The sound is 16 kHz mono,
+about 0.2–0.3 s behind, and encrypted (ChaCha20, key from the admin password and a one-time
+token). LamaxTool raises a quiet laptop microphone automatically (up to +20 dB). If the
+camera can be heard by the computer's microphone (same room) the loop starts to howl: a
+guard turns the gain down within ~1 s, but keep them apart or use a headset. One person
+at a time; it is one-way (listen with the stream's microphone track, `AUDIO=1`).
+On Linux the microphone needs PortAudio (`sudo apt install libportaudio2`).
+
 ### WiFi scan in LamaxTool
 
 **Scan WiFi w. camera** uses the camera's own radio, so it needs a camera that already
@@ -156,7 +169,6 @@ Windows line endings are fine). The file is self-documenting; the main keys:
 | `WATCHDOG` | 1 | reboot if the stream program hangs |
 | `LOG` | `off` | `sd` = `cam/log.txt` (max 2 × 512 KB, rotated while running), `ram` = RAM only, nothing written to the card, `off` |
 | `WIFI_DEBUG_LOG` | 0 | verbose `cam/wpa_log.txt` (max 2 × 1 MB) |
-
 ## Screen and buttons
 
 * **Status page:** network name, signal strength in dBm with bars and a rating

@@ -1,5 +1,8 @@
 /* Minimal ALSA PCM access with the kernel ioctls (no libtinyalsa: the camera's
- * copy crashes in pcm_read). 16-bit signed little-endian, interleaved. */
+ * copy crashes in pcm_read). 16-bit signed little-endian, interleaved.
+ * Playback on this camera needs the mixer control "Speaker Function" written (= 1,
+ * spk) before every open, even if it already reads spk - otherwise the DMA stalls
+ * after the first periods (this is what the stock startup_music does). */
 #ifndef ALSA_H
 #define ALSA_H
 #include <stddef.h>

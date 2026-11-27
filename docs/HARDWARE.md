@@ -49,6 +49,13 @@ page 2048, ~28 KB free). `script.bin` (board config) lives in `uboot` at offset 
 
 ## Sound
 
+* **Speaker playback needs the mixer control `Speaker Function` (16) written to 1 (`spk`)
+  before every playback**, even though it already reads `spk`: writing it runs the driver
+  code that switches the speaker path on. Without it the DMA stalls after the first periods
+  (RUNNING, `hw_ptr` stuck, writes fail with EIO after ~10 s). This is all the stock
+  `startup_music` does: `tinymix 1 <voicevol>` (Line Volume from `menu.cfg`), `tinymix 16 1`,
+  `tinyplay <file>` (found with `strings` / `objdump` – it only calls `system()`).
+  Playback accepts 8 and 16 kHz mono with periods of 256–640 frames × 4 (320 × 8 is rejected).
 * Microphone: card 0 capture works with plain ALSA ioctls (`src/alsa.c`); the camera's
   `libtinyalsa.so` crashes in `pcm_read` (SIGFPE). Mono 8 kHz is accepted with a period of
   320 frames (40 ms) or more; 160 is rejected. Mixer: `Audio main mic` 1, `Audio capture route
@@ -69,6 +76,16 @@ page 2048, ~28 KB free). `script.bin` (board config) lives in `uboot` at offset 
   out` reads Off while sound plays. `startup_music` sets Line Volume to 29 when it starts;
   `autorun.sh` sets it back to 31 right after. LamaxTool normalises the WAV and adds a tanh soft
   limiter (≈ +9 dB RMS), which still sounded clean on the camera.
+
+## WiFi link
+
+* The XR819 starts with power management **on** (`SIOCGIWPOWER`). With it, pings to the camera
+  took ~200 ms with 30–60 % loss and UDP streams stalled; switched off (`camnet powersave
+  wlan0 off`, done by `autorun.sh` after every connection) the
+  same link answered in ~20 ms without loss. It is always switched off: the saving (tens
+  of mW, only while nobody watches) is negligible next to the camera's 1.5-2 W. On a network with several access points the
+  camera also roams between them; a busy or distant one gives 200–300 ms even with power
+  saving off – then lower the bitrate, or use TCP in the player.
 
 ## Clock
 

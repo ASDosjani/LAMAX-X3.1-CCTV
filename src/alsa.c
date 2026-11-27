@@ -114,7 +114,8 @@ int alsa_write(alsa_t *a, const int16_t *buf, unsigned frames)
 void alsa_close(alsa_t *a)
 {
     if (a->fd >= 0) {
-        ioctl(a->fd, SNDRV_PCM_IOCTL_DROP);
+        /* playback: let the buffered sound finish; capture: just stop */
+        ioctl(a->fd, a->capture ? SNDRV_PCM_IOCTL_DROP : SNDRV_PCM_IOCTL_DRAIN);
         close(a->fd);
     }
     a->fd = -1;

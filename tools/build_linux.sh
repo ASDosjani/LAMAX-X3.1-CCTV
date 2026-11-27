@@ -11,14 +11,14 @@ python3 -c 'import tkinter' 2>/dev/null || { echo "tkinter missing: sudo apt ins
 VENV=${VENV:-$HOME/.cache/lamaxtool-venv}
 if [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV" >/dev/null 2>&1; then
     PY="$VENV/bin/python"
-    "$PY" -m pip install --quiet --upgrade pip pyinstaller
+    "$PY" -m pip install --quiet --upgrade pip pyinstaller sounddevice
 else
     # no python3-venv package: fall back to a per-user install
     rm -rf "$VENV"
     PY=python3
-    "$PY" -m pip install --quiet --user pyinstaller
+    "$PY" -m pip install --quiet --user pyinstaller sounddevice
 fi
-"$PY" -m PyInstaller --noconfirm --clean --onefile --windowed --name LamaxTool \
+"$PY" -m PyInstaller --noconfirm --clean --onefile --windowed --name LamaxTool --exclude-module numpy \
     --distpath dist --workpath build/pyinstaller-linux --specpath build \
     --add-data "$ROOT/boot/make_boot.py:boot" \
     --add-data "$ROOT/boot/init.camsd.sh:boot" \
