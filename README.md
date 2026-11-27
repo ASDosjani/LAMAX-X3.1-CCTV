@@ -22,7 +22,8 @@ WiFi security camera: after power-on it joins your WiFi and serves an
 | | |
 |---|---|
 | Video | 2688×1520 (2.7K), 1920×1080 or 1280×720, 1–30 fps, H.264 baseline/main/high, hardware encoder (≈13 ms per 1080p frame, ≈27 ms at 2688×1520) |
-| RTSP | `rtsp://<ip>:554/stream`, RTP over UDP or TCP (interleaved), Digest + Basic auth, up to 8 clients |
+| Audio | optional: built-in microphone as a second track, G.711 µ-law (PCMU) 8 kHz, in sync with the video |
+| RTSP | `rtsp://<ip>:554/stream`, RTP over UDP or TCP (interleaved), optional Digest login (like Hikvision), up to 8 clients |
 | Network | 2.4 GHz WiFi, WPA2-PSK or open, DHCP or static IP, automatic reconnect |
 | Time stamp | date and time burned into the picture (optionally with the camera name, and the battery percentage while there is no external power), any corner; time from the network (SNTP), POSIX time zone |
 | Screen | status page: WiFi name, **live signal strength (dBm)** for finding a good mounting spot, IP, clients, bitrate, battery / DC icon; WiFi scan page; sleeps after 60 s, wakes on any button |
@@ -75,6 +76,32 @@ WiFi security camera: after power-on it joins your WiFi and serves an
 
 Manual installation without the tool: [docs/INSTALL.md](docs/INSTALL.md).
 
+### Configuration over WiFi
+
+Set an **admin password** on the tool's 🌐 Remote tab (`ADMIN_PASSWORD`, at least 8
+characters, not the RTSP password) and write the SD card once over USB. After the camera
+restarts, choose **📶 WiFi** at the top of LamaxTool and enter the camera's IP (with the
+camera on USB, **Get stream link** fills it in). Then these work without a cable:
+**Read from camera**, **Write to camera SD card** (only `config.txt`; it offers to restart
+the camera), **⏻ Reboot camera**, **Scan WiFi w. camera**, **Get stream link**, and
+**⟳ Refresh** shows name, resolution, battery and uptime.
+Updating the camera programs, flash backup and the boot hook still need USB (or a card
+reader for the programs).
+
+Security: the camera runs a small HTTP service (`camcfg`, port `ADMIN_PORT`, default 8080)
+only when an admin password is set. Logins use HTTP Digest (the password itself is never
+sent), every request is signed once (a recorded request cannot be replayed), and a wrong
+password costs 1 s. The `config.txt` contents – with the WiFi, RTSP and admin passwords –
+travel **encrypted** in both directions: ChaCha20 with a fresh key per message and
+HMAC-SHA256 against changes, the key derived from the admin password (PBKDF2, 20 000
+rounds), and messages older than 5 minutes (camera clock) are refused. Someone listening on
+the network (e.g. a guest WiFi) sees neither the passwords nor the settings. Not encrypted:
+the status (name, IP, battery), the WiFi scan list and the video stream itself. A weak admin
+password can still be guessed offline from a recorded exchange: use a long random one.
+Do not forward the port to the internet.
+A changed admin password takes effect after the camera restarts. If new WiFi settings are
+wrong, the camera cannot come back on WiFi: fix them over USB.
+
 ### WiFi scan in LamaxTool
 
 **Scan WiFi w. camera** uses the camera's own radio, so it needs a camera that already
@@ -92,8 +119,15 @@ the network name.
   everything on it anyway (adb gives a root shell without a password – that is how
   the stock firmware ships). A guest network keeps a stolen camera from being a
   key to your home network.
-* Set `RTSP_USER` / `RTSP_PASSWORD` if other devices share the camera network.
-* There is no ONVIF and no web interface; only RTSP (TCP 554, UDP 6970/6971) is served.
+* **Set `RTSP_USER` / `RTSP_PASSWORD`** – otherwise anyone on the camera's network can open
+  the stream with just the IP address. The login works like on Hikvision cameras: Digest
+  only (no Basic, the password never travels readably), a fresh challenge for every login
+  that is used up by it (a recorded login cannot be replayed), 1 s penalty per wrong
+  password. Like on practically every IP camera, the **video itself is not encrypted**:
+  someone who records the traffic can still watch it. Give the cameras a network of their
+  own (or one shared only with the NVR / PC that records them).
+* There is no ONVIF and no web interface; only RTSP (TCP 554, UDP 6970/6971, audio 6972/6973) is served,
+  plus – only with an `ADMIN_PASSWORD` – the configuration service for LamaxTool (TCP 8080).
 
 ## Configuration
 
@@ -108,12 +142,15 @@ Windows line endings are fine). The file is self-documenting; the main keys:
 | `IP_MODE` | `dhcp` | `static` uses `IP_ADDRESS`, `IP_NETMASK`, `IP_GATEWAY`, `IP_DNS` |
 | `VIDEO_WIDTH`/`HEIGHT`/`FPS`/`BITRATE_KBPS` | 1920/1080/15/3000 | 15 fps is plenty for surveillance; 3000 kbit/s ≈ 32 GB a day. 2688×1520: use 15–20 fps, about 5000–6000 kbit/s. The tool's 💡 button shows the suggested bitrate for the chosen resolution and fps |
 | `VIDEO_GOP_SECONDS`, `VIDEO_PROFILE`, `VIDEO_FLIP` | 2 / main / 0 | flip = rotate 180° |
-| `RTSP_PORT`, `RTSP_PATH`, `RTSP_USER`, `RTSP_PASSWORD` | 554 / stream | |
+| `RTSP_PORT`, `RTSP_PATH`, `RTSP_USER`, `RTSP_PASSWORD` | 554 / stream | empty user = no login; Digest login otherwise (see Security) |
+| `AUDIO`, `AUDIO_GAIN` | 0 / 7 | 1 = microphone as a second RTSP track (G.711 µ-law 8 kHz, 64 kbit/s, raw – no noise reduction); gain 0–7 |
+| `ADMIN_PASSWORD`, `ADMIN_PORT` | empty / 8080 | configuration over WiFi with LamaxTool (user `admin`); empty = off, USB only. At least 8 characters, different from the RTSP password; long and random is best |
 | `OSD_TIME`, `OSD_POSITION`, `OSD_NAME` | 1 / top-left / 0 | date and time in the picture, corner, camera name in front of it |
 | `OSD_BATTERY` | 1 | `BAT 87%` after the time while running from the battery (nothing on external power) |
 | `TIMEZONE` | `CET-1CEST,M3.5.0,M10.5.0/3` | POSIX TZ string (examples in `config.txt`; LamaxTool has a list) |
 | `NTP_SERVER` | `pool.ntp.org` | time server; the WiFi router is tried as well. Synced after WiFi connects, then every 6 h |
 | `SCREEN_TIMEOUT` | 60 | seconds; 0 = always on |
+| `STARTUP_SOUND` | 1 | play `cam/startup.wav` once the camera is on the network (LamaxTool: Device tab → *Startup sound*, any PCM WAV, converted to 22050 Hz mono, max. 10 s, made as loud as possible; the speaker is set to its maximum while it plays). The original power-on sound comes from the stock firmware and stays |
 | `LED` | `on` | `off` = status LEDs off |
 | `BATTERY_LONG_LIFE` | 1 | charge only to 4.10 V (≈ 85–90 %) and, on battery, power off at 10 % / 3.45 V (it starts again when external power returns); 0 = full charge, run until empty |
 | `WATCHDOG` | 1 | reboot if the stream program hangs |
@@ -160,7 +197,8 @@ The red LED is the charger chip's own indicator (blinks while charging) and cann
 cam/autorun.sh      started by the boot hook; starts and supervises everything
 cam/config.txt      settings
 cam/bin/            camd (stream), camui (screen), camled (LEDs), camnet (network helper),
-                    wpa_supplicant + wpa_cli
+                    camcfg (configuration over WiFi), wpa_supplicant + wpa_cli
+cam/startup.wav     own startup sound (optional, STARTUP_SOUND=1)
 cam/log.txt         log, only with LOG=sd (rotated at 512 KB while running, previous part in log.txt.old)
 cam/wifi_scan.txt   last WiFi scan
 ```
@@ -173,7 +211,13 @@ cam/wifi_scan.txt   last WiFi scan
 * **No WiFi:** only 2.4 GHz is supported; WPA3-only networks do not work (WPA2/WPA3
   mixed mode does). Set `WIFI_DEBUG_LOG=1` and check `cam/wpa_log.txt`.
 * **Back to stock:** set `MODE=stock`, remove the `cam` folder, or restore the boot
-  partition with LamaxTool (**Restore original boot**).
+  partition with LamaxTool (**Restore original boot**). The tool uses the camera's own
+  backup, or – for a camera without one – the reference dump in `ORIGINAL_FW/` (an
+  untouched camera, firmware build 2021-11-05; its boot image is also built into LamaxTool).
+  It only writes a boot image whose **system partition is identical** to the camera's:
+  units with the same build number can still carry different firmware revisions, and the
+  adb serial (`20080411`) is the same on every camera, so it cannot tell cameras apart.
+  `ORIGINAL_FW/` is LAMAX's own firmware, published here for recovery purposes.
 * After three starts in a row that did not survive two minutes, the next start stays
   with the stock software once (boot-loop protection).
 * The camera is reachable over adb while our software runs (USB is switched on by

@@ -23,6 +23,8 @@ rm -rf "$OUT" dist/LamaxTool.app
     --add-data "$ROOT/boot/make_boot.py:boot" \
     --add-data "$ROOT/boot/init.camsd.sh:boot" \
     --add-data "$ROOT/sdcard/cam:sdcard/cam" \
+    --add-data "$ROOT/ORIGINAL_FW/mtdblock1_boot.bin:ORIGINAL_FW" \
+    --add-data "$ROOT/ORIGINAL_FW/SHA256SUMS:ORIGINAL_FW" \
     tools/lamax_tool.py
 mkdir -p dist
 mv "$OUT/LamaxTool.app" dist/      # the .app bundle is the result (not the --onedir folder)

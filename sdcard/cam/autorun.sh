@@ -138,6 +138,11 @@ CAMUI=$!
 $RUN/camled $CFG &
 CAMLED=$!
 
+# --- wireless configuration for LamaxTool (only with an ADMIN_PASSWORD) -------
+CAMCFG=
+[ -n "$(get ADMIN_PASSWORD)" ] && CAMCFG_ON=1 || CAMCFG_ON=0
+if [ $CAMCFG_ON = 1 ]; then $RUN/camcfg $CFG & CAMCFG=$!; fi
+
 # --- battery charge limit -------------------------------------------------
 # The AXP209 charger has no percentage limit of its own, so switch charging
 # The AXP209 charger has no percentage limit, and the axp driver switches
@@ -178,6 +183,21 @@ ntp_sync() {
     echo "$(ts) $OUT"
 }
 
+# --- own startup sound: cam/startup.wav once the camera is on the network ------
+# Played with the camera's own startup_music player (16-bit PCM WAV; LamaxTool
+# converts any WAV to 22050 Hz mono). STARTUP_SOUND=0 turns it off. The original
+# sound at power-on comes from the stock firmware before this script runs.
+SOUND_DONE=0
+ready_sound() {
+    [ $SOUND_DONE = 0 ] || return
+    SOUND_DONE=1
+    if [ "$(get STARTUP_SOUND 1)" = "1" ] && [ -f $SD/startup.wav ]; then
+        /system/bin/startup_music $SD/startup.wav >/dev/null 2>&1 &
+        # the player sets the speaker level (Line Volume) to 29: back to the maximum 31
+        i=0; while [ $i -lt 15 ]; do tinymix -D 0 1 31 >/dev/null 2>&1; i=$((i + 1)); done
+    fi
+}
+
 # --- supervisor -----------------------------------------------------------
 alive() { [ -n "$1" ] && [ -d /proc/$1 ]; }
 LINKED=0
@@ -208,6 +228,11 @@ while true; do
         $RUN/camled $CFG &
         CAMLED=$!
     fi
+    if [ $CAMCFG_ON = 1 ] && ! alive $CAMCFG; then
+        echo "$(ts) camcfg exited, restarting"
+        $RUN/camcfg $CFG &
+        CAMCFG=$!
+    fi
     if [ ! -S $RUN/wpa/wlan0 ]; then
         echo "$(ts) wpa_supplicant not running, restarting"
         start_wpa
@@ -224,6 +249,7 @@ while true; do
         if [ "$IPLOGGED" = 0 ] && $RUN/camnet show wlan0 > $RUN/ip.txt 2>&1; then
             echo "$(ts) $(cat $RUN/ip.txt)"
             IPLOGGED=1
+            ready_sound
         fi
         [ "$IPLOGGED" = 1 ] && [ $LOOPS -ge $NTP_NEXT ] && ntp_sync
     elif [ $LINKED = 1 ]; then

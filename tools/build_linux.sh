@@ -23,5 +23,7 @@ fi
     --add-data "$ROOT/boot/make_boot.py:boot" \
     --add-data "$ROOT/boot/init.camsd.sh:boot" \
     --add-data "$ROOT/sdcard/cam:sdcard/cam" \
+    --add-data "$ROOT/ORIGINAL_FW/mtdblock1_boot.bin:ORIGINAL_FW" \
+    --add-data "$ROOT/ORIGINAL_FW/SHA256SUMS:ORIGINAL_FW" \
     tools/lamax_tool.py
 echo "Built: $ROOT/dist/LamaxTool"

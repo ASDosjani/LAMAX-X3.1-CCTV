@@ -50,10 +50,23 @@ VIDEO_FLIP=0
 # Stream URL: rtsp://<IP>:<RTSP_PORT>/<RTSP_PATH>
 RTSP_PORT=554
 RTSP_PATH=stream
-# If set, the NVR needs this user name / password (Digest and Basic auth)
+# Login for the stream (Digest, like Hikvision; the password is never sent in clear).
+# Empty = anyone on the network can open it. The video itself is not encrypted.
 RTSP_USER=
 RTSP_PASSWORD=
 RTSP_MAX_CLIENTS=4
+# 1 = the built-in microphone as a second track in the stream: G.711 mu-law
+# (PCMU) 8 kHz mono, 64 kbit/s, no noise reduction. 0 = video only.
+AUDIO=0
+# Microphone gain 0..7 (7 = most sensitive, also the most background noise)
+AUDIO_GAIN=7
+
+# --- Wireless configuration (LamaxTool over WiFi) -------------------------------
+# With a password, LamaxTool can read/write these settings, scan WiFi and restart
+# the camera over the network (user name: admin). Empty = off (USB only).
+# Use a long random password: anyone with it can change everything.
+ADMIN_PASSWORD=
+ADMIN_PORT=8080
 
 # --- Time stamp in the picture ----------------------------------------------
 # 1 = date and time burned into the video, 0 = none
@@ -79,6 +92,12 @@ NTP_SERVER=pool.ntp.org
 # The screen (and its backlight) turns off after this many seconds
 # (0 = always on). Any button shows it again for the same time.
 SCREEN_TIMEOUT=60
+
+# --- Sound ------------------------------------------------------------------
+# 1 = play cam/startup.wav once the camera is on the network (16-bit PCM WAV,
+# e.g. 22050 Hz mono; LamaxTool converts any WAV). No file = no sound.
+# The original sound at power-on is part of the stock firmware and stays.
+STARTUP_SOUND=1
 
 # --- LEDs -------------------------------------------------------------------
 # on  = the blue and the top yellow LED show the state:

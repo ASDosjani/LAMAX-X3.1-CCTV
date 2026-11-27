@@ -16,6 +16,8 @@ $ErrorActionPreference = 'Continue'
     --add-data "$root\boot\make_boot.py;boot" `
     --add-data "$root\boot\init.camsd.sh;boot" `
     --add-data "$root\sdcard\cam;sdcard\cam" `
+    --add-data "$root\ORIGINAL_FW\mtdblock1_boot.bin;ORIGINAL_FW" `
+    --add-data "$root\ORIGINAL_FW\SHA256SUMS;ORIGINAL_FW" `
     tools\lamax_tool.py
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed ($LASTEXITCODE)" }
 Write-Output "Built: $root\dist\LamaxTool.exe"

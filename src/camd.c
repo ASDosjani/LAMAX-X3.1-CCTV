@@ -1,6 +1,7 @@
 /* camd: camera -> hardware H.264 -> RTSP server.
  * usage: camd [config.txt]   (default /mnt/extsd/cam/config.txt)
  * Writes a one-line status file (/dev/cam/camd.status) for camui. */
+#include "audio.h"
 #include "config.h"
 #include "h264enc.h"
 #include "log.h"
@@ -130,6 +131,7 @@ int main(int argc, char **argv)
         .name = config_get(cfg, "CAMERA_NAME", "LAMAX"),
         .fps = fps,
         .max_clients = config_int(cfg, "RTSP_MAX_CLIENTS", 4),
+        .audio = config_int(cfg, "AUDIO", 0),
     };
     rtsp_server_t *srv = rtsp_create(&rc);
     if (!srv) return 1;
@@ -144,20 +146,38 @@ int main(int argc, char **argv)
     int frames = 0, encoded = 0;
     uint64_t sent_bytes = 0;
     char status[256];
+    /* microphone: started with the first video frame, whose time stamp tells
+     * which clock the camera driver uses (audio must use the same one) */
+    audio_t *aud = NULL;
+    int want_audio = rc.audio;
     while (!g_stop) {
-        struct pollfd pf[16];
+        struct pollfd pf[18];
         pf[0].fd = cap.fd; pf[0].events = POLLIN; pf[0].revents = 0;
-        int n = 1 + rtsp_pollfds(srv, pf + 1, 15);
+        pf[1].fd = audio_fd(aud); pf[1].events = POLLIN; pf[1].revents = 0;   /* fd -1 is ignored by poll */
+        int n = 2 + rtsp_pollfds(srv, pf + 2, 16);
         int r = poll(pf, n, 1000);
         double t = now_s();
         if (wd >= 0 && t - last_wd >= 2) { write(wd, "1", 1); last_wd = t; }
         if (r < 0 && errno != EINTR) break;
-        if (r > 0) rtsp_process(srv, pf + 1, n - 1);
+        if (r > 0) rtsp_process(srv, pf + 2, n - 2);
+
+        if (pf[1].revents & POLLIN) {
+            audio_block_t ab;
+            while (audio_read(aud, &ab)) rtsp_send_audio(srv, ab.ulaw, AUDIO_BLOCK, ab.pts_us);
+        }
 
         if (pf[0].revents & POLLIN) {
             cap_frame_t f;
             if (cap_get(&cap, &f, 0) == 1) {
                 frames++;
+                if (want_audio) {
+                    want_audio = 0;
+                    struct timespec rt; clock_gettime(CLOCK_REALTIME, &rt);
+                    int64_t real_us = (int64_t)rt.tv_sec * 1000000 + rt.tv_nsec / 1000;
+                    clockid_t clk = llabs(f.ts_us - real_us) < 5000000 ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+                    LOGI("audio: video time stamps use CLOCK_%s", clk == CLOCK_REALTIME ? "REALTIME" : "MONOTONIC");
+                    aud = audio_start(config_int(cfg, "AUDIO_GAIN", 7), clk);
+                }
                 int playing = rtsp_playing(srv);
                 /* frame rate limiter: keep one frame per 1/fps time slot */
                 int64_t slot = (f.ts_us + 5000) * fps / 1000000;
@@ -186,6 +206,7 @@ int main(int argc, char **argv)
         }
     }
     LOGI("camd: stopping");
+    audio_stop(aud);
     rtsp_destroy(srv);
     h264enc_close(enc);
     osd_free(osd);

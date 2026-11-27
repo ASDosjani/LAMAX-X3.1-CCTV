@@ -47,6 +47,29 @@ page 2048, ~28 KB free). `script.bin` (board config) lives in `uboot` at offset 
   The 8×16 font is scaled to about 3.2 % of the frame height in half steps:
   48 px at 1520p (3×), 32 px at 1080p (2×), 24 px at 720p (1.5×).
 
+## Sound
+
+* Microphone: card 0 capture works with plain ALSA ioctls (`src/alsa.c`); the camera's
+  `libtinyalsa.so` crashes in `pcm_read` (SIGFPE). Mono 8 kHz is accepted with a period of
+  320 frames (40 ms) or more; 160 is rejected. Mixer: `Audio main mic` 1, `Audio capture route
+  switch` 1, `Audio record source` mic1, `MIC1 boost AMP gain control` 0–7 (camd: `AUDIO_GAIN`).
+  `Audio noise reduced` (hardware noise reduction) stays off. The noise is mostly below 300 Hz.
+* The V4L2 frame time stamps are CLOCK_MONOTONIC; camd detects this from the first frame and
+  stamps the audio blocks with the same clock, so the RTCP sender reports line both tracks up.
+* Speaker on the internal codec (card 0, `audiocodec`); card 1 (`snddaudio`, I2S/TDM) plays
+  without errors but is not connected to the speaker.
+* init's `startupSound` service runs `/system/bin/startup_music /system/res/others/startup.wav`
+  (11025 Hz mono) at about 3 s; it takes any 16-bit PCM WAV path (22050 Hz mono works).
+* Playing with plain tinyalsa (`tinyplay`, or `libtinyalsa.so` via dlopen) stalls on card 0:
+  the stream is RUNNING but `hw_ptr` stops after 56 frames, writes fail with EIO after
+  ~10 s, no DMA interrupts – even with the stock software running, same `pcm_config`
+  (1024 × 4, RW_INTERLEAVED). `startup_music` works every time, so `autorun.sh` uses it for
+  `cam/startup.wav`. A stalled tinyplay attempt can make the next `startup_music` run fail too.
+* The speaker level is `Line Volume` (0–31); `Master Playback Volume` stays 0 and `Audio speaker
+  out` reads Off while sound plays. `startup_music` sets Line Volume to 29 when it starts;
+  `autorun.sh` sets it back to 31 right after. LamaxTool normalises the WAV and adds a tanh soft
+  limiter (≈ +9 dB RMS), which still sounded clean on the camera.
+
 ## Clock
 
 * No `date`, `ntpd` or busybox on the camera: `camnet ntp` is a small SNTP client

@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [tools/**, boot/**, sdcard/**, src/**, build.sh, third_party/**, .github/workflows/build-macos.yml]
+    paths: [tools/**, boot/**, sdcard/**, src/**, build.sh, third_party/**, ORIGINAL_FW/**, .github/workflows/build-macos.yml]
 
 permissions:
   contents: read

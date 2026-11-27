@@ -10,7 +10,8 @@ Run from source:  python tools/lamax_tool.py   (Linux: python3, needs python3-tk
 Build: tools/build_exe.ps1 (Windows exe), tools/build_linux.sh (Linux binary),
        tools/build_macos.sh (macOS app)
 """
-import datetime, hashlib, io, os, queue, re, shutil, subprocess, sys, tempfile, threading, urllib.request, zipfile
+import datetime, hashlib, io, os, queue, re, shutil, subprocess, sys, tempfile, threading, time, zipfile
+import urllib.error, urllib.request
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -28,6 +29,9 @@ import make_boot  # noqa: E402
 
 SD_SRC = os.path.join(RES, 'sdcard', 'cam')
 BACKUPS = os.path.join(HOME, 'backups')
+# reference dump of an untouched camera (repo folder; its boot image + SHA256SUMS are
+# also bundled into the program), used when a camera has no backup of its own
+ORIGINAL_FW_DIRS = [os.path.join(HOME, 'ORIGINAL_FW'), os.path.join(RES, 'ORIGINAL_FW')]
 PART_SIZE = make_boot.PART_SIZE
 EXPECTED_MTD = [('uboot', 0x40000), ('boot', 0x280000), ('system', 0x480000), ('cfg', 0x50000),
                 ('boot_logo', 0x10000), ('shutdown_logo', 0x10000), ('env', 0x10000), ('private', 0x10000)]
@@ -81,6 +85,163 @@ class Adb:
 
     def pull(self, remote, local, timeout=300):
         self.run('pull', remote, local, timeout=timeout)
+
+
+# ----------------------------------------------------------------------------- encrypted envelope
+# Same format as src/seal.c: the config.txt contents travel encrypted over WiFi.
+#   master = PBKDF2-HMAC-SHA256(admin password, "lamax-x31-camcfg-v1", 20000), per message a random
+#   16-byte salt -> ChaCha20 key and HMAC key; "LXE1" | salt | time (camera clock) | ciphertext | tag
+
+def _chacha20_xor(key, nonce, counter, data):
+    import struct
+    def rotl(v, n):
+        return ((v << n) | (v >> (32 - n))) & 0xffffffff
+    const = (0x61707865, 0x3320646e, 0x79622d32, 0x6b206574)
+    k = struct.unpack('<8I', key)
+    nn = struct.unpack('<3I', nonce)
+    out = bytearray(data)
+    for blk in range(0, len(out), 64):
+        st = list(const) + list(k) + [(counter + blk // 64) & 0xffffffff] + list(nn)
+        x = st[:]
+        for _ in range(10):
+            for a, b, c, d in ((0, 4, 8, 12), (1, 5, 9, 13), (2, 6, 10, 14), (3, 7, 11, 15),
+                               (0, 5, 10, 15), (1, 6, 11, 12), (2, 7, 8, 13), (3, 4, 9, 14)):
+                x[a] = (x[a] + x[b]) & 0xffffffff; x[d] = rotl(x[d] ^ x[a], 16)
+                x[c] = (x[c] + x[d]) & 0xffffffff; x[b] = rotl(x[b] ^ x[c], 12)
+                x[a] = (x[a] + x[b]) & 0xffffffff; x[d] = rotl(x[d] ^ x[a], 8)
+                x[c] = (x[c] + x[d]) & 0xffffffff; x[b] = rotl(x[b] ^ x[c], 7)
+        ks = struct.pack('<16I', *((x[i] + st[i]) & 0xffffffff for i in range(16)))
+        for i in range(min(64, len(out) - blk)):
+            out[blk + i] ^= ks[i]
+    return bytes(out)
+
+
+def seal_master(password):
+    return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), b'lamax-x31-camcfg-v1', 20000, 32)
+
+
+def _subkeys(master, salt):
+    import hmac
+    return (hmac.new(master, b'enc' + salt, hashlib.sha256).digest(),
+            hmac.new(master, b'mac' + salt, hashlib.sha256).digest())
+
+
+def seal(master, plain, now):
+    import hmac, struct
+    salt = os.urandom(16)
+    enc, mac = _subkeys(master, salt)
+    head = b'LXE1' + salt + struct.pack('>Q', int(now))
+    body = head + _chacha20_xor(enc, bytes(12), 1, plain)
+    return body + hmac.new(mac, body, hashlib.sha256).digest()
+
+
+def seal_open(master, data, now):
+    """plaintext, or RuntimeError (wrong password / tampered / too old)"""
+    import hmac, struct
+    if len(data) < 60 or data[:4] != b'LXE1':
+        raise RuntimeError('The camera did not send encrypted data - update the camera programs '
+                           '(write the SD card over USB once).')
+    enc, mac = _subkeys(master, data[4:20])
+    if not hmac.compare_digest(hmac.new(mac, data[:-32], hashlib.sha256).digest(), data[-32:]):
+        raise RuntimeError('The encrypted answer of the camera does not check out (wrong admin password, '
+                           'or it was altered on the way).')
+    t = struct.unpack('>Q', data[20:28])[0]
+    if abs(t - now) > 300:
+        raise RuntimeError('The encrypted answer of the camera is too old (replayed?).')
+    return _chacha20_xor(enc, bytes(12), 1, data[28:-32])
+
+
+class CamNet:
+    """The camera over WiFi: camcfg's HTTP API (Digest login, user "admin",
+    password ADMIN_PASSWORD). Only settings, reboot, WiFi scan and status -
+    flashing needs USB."""
+
+    class WrongPassword(Exception):
+        pass
+
+    def __init__(self, host, port, passwords):
+        """passwords: tried in order (the form's, then the one that worked last:
+        a changed ADMIN_PASSWORD only takes effect after the camera restarts)."""
+        self.host, self.port = host, int(port)
+        self.serial = '%s:%d' % (host, self.port)        # shown like an adb serial
+        self.base = 'http://%s:%d' % (host, self.port)
+        self.passwords = [p for i, p in enumerate(passwords) if p and p not in passwords[:i]]
+        self.password = None
+        self._use(self.passwords[0])
+
+    class _Digest(urllib.request.HTTPDigestAuthHandler):
+        """Give up at the first rejected login (urllib would retry 5 more times,
+        each costing 1 s on the camera); only a stale nonce is retried."""
+        def http_error_401(self, req, fp, code, msg, headers):
+            if req.get_header('Authorization') and 'stale=true' not in headers.get('WWW-Authenticate', '').lower():
+                raise urllib.error.HTTPError(req.full_url, 401, 'wrong password', headers, fp)
+            return super().http_error_401(req, fp, code, msg, headers)
+
+    def _use(self, password):
+        pm = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        pm.add_password(None, self.base, 'admin', password)
+        self.opener = urllib.request.build_opener(CamNet._Digest(pm))
+        self.password = password
+
+    def request(self, method, path, body=None, timeout=10):
+        for i, pw in enumerate(self.passwords):
+            if pw != self.password:
+                self._use(pw)
+            try:
+                return self._request(method, path, body, timeout)
+            except CamNet.WrongPassword:
+                if i == len(self.passwords) - 1:
+                    raise RuntimeError('Wrong admin password for the camera at %s.\n'
+                                       'It is the ADMIN_PASSWORD on the camera (Remote tab); a changed '
+                                       'password takes effect after the camera restarts.' % self.serial)
+
+    def _request(self, method, path, body, timeout):
+        req = urllib.request.Request(self.base + path, data=body, method=method)
+        if body is not None:
+            req.add_header('Content-Type', 'text/plain; charset=utf-8')
+        try:
+            with self.opener.open(req, timeout=timeout) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise CamNet.WrongPassword()
+            raise RuntimeError('Camera %s: %s %s' % (self.serial, e.code, e.read().decode('utf-8', 'replace').strip()))
+        except (urllib.error.URLError, OSError) as e:
+            raise RuntimeError('The camera does not answer at %s (%s).\nIs it on, on the same network, '
+                               'and does its config.txt have an ADMIN_PASSWORD?'
+                               % (self.serial, getattr(e, 'reason', e)))
+
+    def get(self, path, timeout=10):
+        return self.request('GET', path, timeout=timeout).decode('utf-8', 'replace')
+
+    def post(self, path, timeout=10):
+        return self.request('POST', path, body=b'', timeout=timeout).decode('utf-8', 'replace')
+
+    # config.txt travels encrypted (seal / seal_open, the key comes from the admin password).
+    # Time stamps use the camera's clock, so a wrong camera clock does not break it.
+    def _camera_now(self):
+        if getattr(self, '_clock_offset', None) is None:
+            import calendar
+            st = parse_config(self.get('/api/status'))
+            cam = calendar.timegm(time.strptime(st['TIME_UTC'], '%Y-%m-%d %H:%M:%S'))
+            self._clock_offset = cam - time.time()
+        return time.time() + self._clock_offset
+
+    def _master(self):
+        cache = self.__dict__.setdefault('_masters', {})
+        if self.password not in cache:
+            cache[self.password] = seal_master(self.password)
+        return cache[self.password]
+
+    def read_config(self):
+        data = self.request('GET', '/api/config')           # may switch to the other password
+        return seal_open(self._master(), data, self._camera_now()).decode('utf-8', 'replace')
+
+    def write_config(self, text):
+        now = self._camera_now()
+        self.request('GET', '/api/status')                   # settle on the password that works
+        body = seal(self._master(), text.encode('utf-8'), now)
+        return self.request('PUT', '/api/config', body=body, timeout=20).decode('utf-8', 'replace')
 
 
 # ----------------------------------------------------------------------------- operations
@@ -150,6 +311,47 @@ def latest_backup(serial, original_only=True):
     return None
 
 
+def read_sums(folder):
+    """{file name: sha256} from a backup's SHA256SUMS (empty if missing)."""
+    try:
+        return {p[1]: p[0] for p in (l.split() for l in open(os.path.join(folder, 'SHA256SUMS'))) if len(p) >= 2}
+    except OSError:
+        return {}
+
+
+def camera_system_hash(adb):
+    """sha256 of the camera's system partition. We never change it, and it differs
+    between firmware revisions - so it tells which backups fit this camera."""
+    tmp = tempfile.mkdtemp()
+    try:
+        p = os.path.join(tmp, 'system.bin')
+        adb.pull('/dev/block/mtdblock2', p)
+        return sha256(open(p, 'rb').read())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def find_original_boot(adb, serial, log):
+    """(folder, boot image) of an original (hook-free) boot partition that belongs to this
+    camera's firmware: its own backups first (newest first), then ORIGINAL_FW. A candidate
+    must have the same system partition as the camera - the adb serial is not unique
+    (several cameras report 20080411), and firmware revisions differ between units."""
+    sys_hash = camera_system_hash(adb)
+    names = sorted(os.listdir(BACKUPS), reverse=True) if os.path.isdir(BACKUPS) else []   # newest first
+    names.sort(key=lambda d: not d.startswith(serial + '_'))                                # this serial first
+    for folder in [os.path.join(BACKUPS, d) for d in names] + ORIGINAL_FW_DIRS:
+        sums = read_sums(folder)
+        bootf = os.path.join(folder, 'mtdblock1_boot.bin')
+        if sums.get('mtdblock2_system.bin') != sys_hash or not os.path.isfile(bootf):
+            continue
+        boot = open(bootf, 'rb').read()
+        if sums.get('mtdblock1_boot.bin') != sha256(boot) or make_boot.has_hook(boot):
+            continue
+        log('Original boot partition for this camera: %s' % folder)
+        return folder, boot
+    return None, None
+
+
 FLASH_SCRIPT = '''
 cmp /dev/lt_new.img /dev/block/mtdblock1 >/dev/null 2>&1 && { echo ALREADY; rm -f /dev/lt_*.img; exit 0; }
 cat /dev/lt_new.img > /dev/block/mtdblock1
@@ -193,11 +395,10 @@ def flash_boot(adb, image, orig, log):
 
 
 def install_hook(adb, serial, log):
-    folder = latest_backup(serial)
+    folder, orig = find_original_boot(adb, serial, log)
     if not folder:
-        raise RuntimeError('No backup of the original firmware of this camera (%s) - make a backup '
-                           'first (before installing the hook).' % serial)
-    orig = open(os.path.join(folder, 'mtdblock1_boot.bin'), 'rb').read()
+        raise RuntimeError('No backup of this camera\'s original firmware (and ORIGINAL_FW is a different '
+                           'firmware revision) - make a backup first, before installing the hook.')
     tmp = tempfile.mkdtemp()
     try:
         p = os.path.join(tmp, 'cur.bin')
@@ -218,10 +419,10 @@ def install_hook(adb, serial, log):
 
 
 def restore_boot(adb, serial, log):
-    folder = latest_backup(serial)
+    folder, orig = find_original_boot(adb, serial, log)
     if not folder:
-        raise RuntimeError('No backup of the original firmware of this camera (%s).' % serial)
-    orig = open(os.path.join(folder, 'mtdblock1_boot.bin'), 'rb').read()
+        raise RuntimeError('No original boot partition for this camera: no backup of its own, and '
+                           'ORIGINAL_FW is a different firmware revision (its system partition differs).')
     flash_boot(adb, orig, orig, log)
     log('Original boot partition restored. It takes effect after a reboot.')
 
@@ -252,12 +453,17 @@ SETTINGS = [
     ('Time', 'TIMEZONE', 'Time zone', 'tz', None),
     ('RTSP', 'RTSP_PORT', 'RTSP port', 'int', (1, 65535)),
     ('RTSP', 'RTSP_PATH', 'Stream path', 'text', None),
-    ('RTSP', 'RTSP_USER', 'User name (empty = no auth)', 'text', None),
+    ('RTSP', 'RTSP_USER', 'User name (empty = no login)', 'text', None),
     ('RTSP', 'RTSP_PASSWORD', 'Password', 'password', None),
     ('RTSP', 'RTSP_MAX_CLIENTS', 'Max. clients', 'int', (1, 8)),
+    ('RTSP', 'AUDIO', 'Microphone sound in the stream (G.711)', 'bool', ('1', '0')),
+    ('RTSP', 'AUDIO_GAIN', 'Microphone gain (0-7)', 'int', (0, 7)),
+    ('Remote', 'ADMIN_PASSWORD', 'Admin password (empty = USB only)', 'password', None),
+    ('Remote', 'ADMIN_PORT', 'Port', 'int', (1, 65535)),
     ('Device', 'MODE', 'Mode', 'choice', ['camera', 'stock']),
     ('Device', 'SCREEN_TIMEOUT', 'Screen off after (s, 0 = never)', 'int', (0, 3600)),
     ('Device', 'LED', 'Status LEDs', 'bool', ('on', 'off')),
+    ('Device', 'STARTUP_SOUND', 'Startup sound when on the network', 'bool', ('1', '0')),
     ('Device', 'BATTERY_LONG_LIFE', 'Battery long life (charge to ~85-90 %, off at 10 %)', 'bool', ('1', '0')),
     ('Device', 'WATCHDOG', 'Reboot if the stream hangs', 'bool', ('1', '0')),
     ('Device', 'LOG', 'Log (sd / ram = not on the card / off)', 'choice', ['sd', 'ram', 'off']),
@@ -282,6 +488,8 @@ FALLBACK_DEFAULTS = {'CAMERA_NAME': 'camera1', 'IP_MODE': 'dhcp', 'IP_ADDRESS': 
                      'VIDEO_WIDTH': '1920', 'VIDEO_HEIGHT': '1080', 'VIDEO_FPS': '15',
                      'VIDEO_BITRATE_KBPS': '3000', 'VIDEO_GOP_SECONDS': '2', 'VIDEO_PROFILE': 'main',
                      'VIDEO_FLIP': '0', 'RTSP_PORT': '554', 'RTSP_PATH': 'stream', 'RTSP_MAX_CLIENTS': '4',
+                     'ADMIN_PASSWORD': '', 'ADMIN_PORT': '8080', 'STARTUP_SOUND': '1',
+                     'AUDIO': '0', 'AUDIO_GAIN': '7',
                      'MODE': 'camera', 'SCREEN_TIMEOUT': '60', 'LED': 'on', 'BATTERY_LONG_LIFE': '1',
                      'WATCHDOG': '1', 'WIFI_DEBUG_LOG': '0', 'LOG': 'off', 'OSD_TIME': '1', 'OSD_NAME': '0', 'OSD_BATTERY': '1',
                      'OSD_POSITION': 'top-left', 'TIMEZONE': 'CET-1CEST,M3.5.0,M10.5.0/3', 'NTP_SERVER': 'pool.ntp.org'}
@@ -367,6 +575,14 @@ def validate(v):
                            % v.get('TIMEZONE', ''))
     if bool(v.get('RTSP_USER')) != bool(v.get('RTSP_PASSWORD')):
         raise RuntimeError('Set both the RTSP user name and password, or neither.')
+    if any(ch in v.get('RTSP_USER', '') + v.get('RTSP_PASSWORD', '') for ch in '"\\'):
+        raise RuntimeError('The RTSP user name and password cannot contain " or \\ (Digest login).')
+    ap = v.get('ADMIN_PASSWORD', '')
+    if ap and len(ap) < 8:
+        raise RuntimeError('The admin password must be at least 8 characters (or empty: USB only).')
+    if ap and ap == v.get('RTSP_PASSWORD'):
+        raise RuntimeError('Use a different admin password than the RTSP password: '
+                           'whoever can watch the stream should not be able to change the settings.')
 
 
 def user_settings_dir():
@@ -429,6 +645,54 @@ def make_config(values):
     return text.replace('\r\n', '\n').replace('\n', '\r\n')    # Notepad-friendly
 
 
+SOUND_RATE, SOUND_MAX_S = 22050, 10
+
+
+def convert_sound(path):
+    """Any PCM WAV -> 16-bit mono 22050 Hz WAV bytes (at most 10 s), which the
+    camera's startup_music player handles."""
+    import array, wave
+    try:
+        w = wave.open(path, 'rb')
+    except (wave.Error, EOFError) as e:
+        raise RuntimeError('%s is not a PCM WAV file (%s). Convert it to WAV first, '
+                           'e.g. with Audacity.' % (os.path.basename(path), e))
+    with w:
+        ch, sw, rate, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+        n = min(n, rate * SOUND_MAX_S)
+        raw = w.readframes(n)
+    n = len(raw) // (sw * ch)
+    if sw == 1:
+        s = [(b - 128) / 128.0 for b in raw]
+    elif sw == 2:
+        s = [v / 32768.0 for v in array.array('h', raw[:n * ch * 2])]
+    elif sw in (3, 4):
+        s = [int.from_bytes(raw[i:i + sw], 'little', signed=True) / float(1 << (8 * sw - 1))
+             for i in range(0, n * ch * sw, sw)]
+    else:
+        raise RuntimeError('Unsupported WAV sample size: %d bytes' % sw)
+    mono = [sum(s[i * ch:(i + 1) * ch]) / ch for i in range(n)]
+    # as loud as the small speaker allows: normalise, then a soft limiter (tanh, about +9 dB)
+    peak = max((abs(v) for v in mono), default=0) or 1.0
+    import math
+    drive = 3.0
+    mono = [math.tanh(drive * v / peak) / math.tanh(drive) * 0.98 for v in mono]
+    m = int(n * SOUND_RATE / rate)
+    out = array.array('h')
+    for i in range(m):
+        x = i * rate / SOUND_RATE
+        j = int(x)
+        a = mono[j]
+        b = mono[j + 1] if j + 1 < n else a
+        v = a + (b - a) * (x - j)
+        out.append(max(-32768, min(32767, int(round(v * 32767)))))
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as o:
+        o.setnchannels(1); o.setsampwidth(2); o.setframerate(SOUND_RATE)
+        o.writeframes(out.tobytes())
+    return buf.getvalue()
+
+
 def sd_files():
     files = [('autorun.sh', os.path.join(SD_SRC, 'autorun.sh'))]
     bindir = os.path.join(SD_SRC, 'bin')
@@ -439,7 +703,7 @@ def sd_files():
     return files
 
 
-def write_sd_adb(adb, config_text, log):
+def write_sd_adb(adb, config_text, log, sound=None):
     mounts = adb.sh('cat /proc/mounts')
     if ' /mnt/extsd ' not in mounts:
         raise RuntimeError('The SD card is not mounted on the camera. If the camera shows the USB mode '
@@ -453,6 +717,11 @@ def write_sd_adb(adb, config_text, log):
         p = os.path.join(tmp, 'config.txt')
         open(p, 'w', encoding='utf-8', newline='').write(config_text)
         adb.push(p, '/mnt/extsd/cam/config.txt')
+        if sound:
+            p = os.path.join(tmp, 'startup.wav')
+            open(p, 'wb').write(sound)
+            adb.push(p, '/mnt/extsd/cam/startup.wav')
+            log('  cam/startup.wav')
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     log('  cam/config.txt written')
@@ -460,12 +729,15 @@ def write_sd_adb(adb, config_text, log):
     log('SD card ready.')
 
 
-def write_sd_folder(root, config_text, log):
+def write_sd_folder(root, config_text, log, sound=None):
     dst = os.path.join(root, 'cam')
     os.makedirs(os.path.join(dst, 'bin'), exist_ok=True)
     for rel, src in sd_files():
         shutil.copyfile(src, os.path.join(dst, rel.replace('/', os.sep)))
         log('  cam/' + rel)
+    if sound:
+        open(os.path.join(dst, 'startup.wav'), 'wb').write(sound)
+        log('  cam/startup.wav')
     open(os.path.join(dst, 'config.txt'), 'w', encoding='utf-8', newline='').write(config_text)
     log('  cam/config.txt written')
     log('Files copied to %s - eject the drive safely before removing the card.' % dst)
@@ -497,11 +769,23 @@ def scan_wifi_camera(adb, on_update=None):
     one entry per name with the strongest signal, strongest first.
     First the camera's cached results (instant), then SCAN_ROUNDS fresh scans merged;
     on_update(nets, final) is called after each step."""
-    w = '/dev/cam/wpa_cli -p /dev/cam/wpa'
-    if 'yes' not in adb.sh('[ -S /dev/cam/wpa/wlan0 ] && echo yes || echo no', timeout=10):
-        raise RuntimeError('The camera is not running the security camera software yet.\n'
-                           'Install the boot hook, write the SD card, restart the camera and connect it '
-                           'over USB again - or type the network name.')
+    if isinstance(adb, CamNet):
+        def fetch(scan):
+            if scan:
+                adb.post('/api/wifi/scan')
+                time.sleep(3)
+            return adb.get('/api/wifi')
+    else:
+        w = '/dev/cam/wpa_cli -p /dev/cam/wpa'
+        if 'yes' not in adb.sh('[ -S /dev/cam/wpa/wlan0 ] && echo yes || echo no', timeout=10):
+            raise RuntimeError('The camera is not running the security camera software yet.\n'
+                               'Install the boot hook, write the SD card, restart the camera and connect it '
+                               'over USB again - or type the network name.')
+
+        def fetch(scan):
+            if scan:
+                return adb.sh('%s scan >/dev/null; sleep 3; %s scan_results' % (w, w), timeout=20)
+            return adb.sh('%s scan_results' % w, timeout=15)
     best = {}
 
     def merge(out):
@@ -515,11 +799,11 @@ def scan_wifi_camera(adb, on_update=None):
                     best[n['ssid']] = n
         return sorted(best.values(), key=lambda n: -n['signal'])
 
-    nets = merge(adb.sh('%s scan_results' % w, timeout=15))
+    nets = merge(fetch(False))
     for i in range(SCAN_ROUNDS):
         if on_update:
             on_update(nets, False)
-        nets = merge(adb.sh('%s scan >/dev/null; sleep 3; %s scan_results' % (w, w), timeout=20))
+        nets = merge(fetch(True))
     if on_update:
         on_update(nets, True)
     return nets
@@ -527,29 +811,30 @@ def scan_wifi_camera(adb, on_update=None):
 
 def rtsp_link(adb):
     """rtsp:// address of the running stream: live IP, port/path of the running
-    server, user name and password from the camera's own config.txt."""
-    out = adb.sh('/dev/cam/camnet show wlan0; echo; cat /dev/cam/camd.status; echo; '
-                 'cat /mnt/extsd/cam/config.txt', timeout=15)
+    server, user name and password from the camera's own config.txt (over WiFi
+    the config comes encrypted)."""
+    if isinstance(adb, CamNet):     # status has "ip=..." and the stream status line
+        out = adb.get('/api/status').replace('ip=', 'wlan0: ', 1) + '\n' + adb.read_config()
+    else:
+        out = adb.sh('/dev/cam/camnet show wlan0; echo; cat /dev/cam/camd.status; echo; '
+                     'cat /mnt/extsd/cam/config.txt', timeout=15)
     m = re.search(r'wlan0:\s+(\d+\.\d+\.\d+\.\d+)', out)
     if not m:
         raise RuntimeError('The camera has no IP address yet (WiFi not connected?).')
-    ip = m.group(1)
     st = dict(re.findall(r'\b(port|path)=(\S+)', out))
     cfg = parse_config(out)
     port = st.get('port') or cfg.get('RTSP_PORT') or '554'
     path = st.get('path') or cfg.get('RTSP_PATH') or 'stream'
     user, pw = cfg.get('RTSP_USER', ''), cfg.get('RTSP_PASSWORD', '')
     from urllib.parse import quote
-    login = ''
-    if user:
-        login = quote(user, safe='') + (':' + quote(pw, safe='') if pw else '') + '@'
-    return 'rtsp://%s%s%s/%s' % (login, ip, '' if port == '554' else ':' + port, path.lstrip('/'))
+    login = quote(user, safe='') + ':' + quote(pw, safe='') + '@' if user else ''
+    return 'rtsp://%s%s%s/%s' % (login, m.group(1), '' if port == '554' else ':' + port, path.lstrip('/'))
 
 
 # ----------------------------------------------------------------------------- GUI
 
 TAB_ICONS = {'Network': '📶 ', 'Video': '🎥 ', 'Time': '🕒 ', 'RTSP': '📡 ',
-             'Device': '⚙ '}
+             'Remote': '🌐 ', 'Device': '⚙ '}
 
 class App(tk.Tk):
     def __init__(self):
@@ -561,6 +846,9 @@ class App(tk.Tk):
         self.busy = False
         self.adb_exe = find_adb()
         self.serial = tk.StringVar()
+        self.conn = tk.StringVar(value='usb')          # usb / wifi
+        self.cam_ip = tk.StringVar()
+        self.sound_path = tk.StringVar()               # WAV for cam/startup.wav (on this PC)
         self.status = tk.StringVar(value='')
         self._build()
         self._pump_id = self.after(100, self._pump)
@@ -584,18 +872,29 @@ class App(tk.Tk):
         self.btns = []
         top = ttk.Frame(self); top.pack(fill='x', padx=8, pady=(8, 2))
         ttk.Label(top, text='📷  Camera:', font=(base, 10, 'bold')).pack(side='left')
-        self.dev_box = ttk.Combobox(top, textvariable=self.serial, width=22, state='readonly')
-        self.dev_box.pack(side='left', padx=6)
+        ttk.Radiobutton(top, text='🔌 USB', variable=self.conn, value='usb',
+                        command=self.refresh).pack(side='left', padx=(6, 2))
+        self.dev_box = ttk.Combobox(top, textvariable=self.serial, width=14, state='readonly')
+        self.dev_box.pack(side='left', padx=(0, 8))
+        ttk.Radiobutton(top, text='📶 WiFi  IP:', variable=self.conn, value='wifi',
+                        command=self.refresh).pack(side='left', padx=(0, 2))
+        ip_entry = ttk.Entry(top, textvariable=self.cam_ip, width=15)
+        ip_entry.pack(side='left', padx=(0, 6))
+        ip_entry.bind('<Return>', lambda _e: (self.conn.set('wifi'), self.refresh()))
         ttk.Button(top, text='⟳ Refresh', command=self.refresh, style='Tool.TButton').pack(side='left')
-        ttk.Label(top, textvariable=self.status, style='Hint.TLabel').pack(side='left', padx=10)
+        top2 = ttk.Frame(self); top2.pack(fill='x', padx=8)
+        ttk.Label(top2, textvariable=self.status, style='Hint.TLabel').pack(side='left')
 
         # ---- 1: flash (one time per camera)
-        flash = ttk.LabelFrame(self, text=' 1 │ Camera flash  (once per camera) ', style='Section.TLabelframe',
-                               padding=(6, 4)); flash.pack(fill='x', **pad)
-        for text, fn in (('💾 Back up flash', self.do_backup), ('🔧 Install boot hook', self.do_install),
-                         ('↩ Restore original boot', self.do_restore), ('⏻ Reboot camera', self.do_reboot),
-                         ('📁 Backups folder', self.open_backups)):
-            button(flash, text, fn, padx=(0, 6), pady=2)
+        self.flash_frame = flash = ttk.LabelFrame(self, style='Section.TLabelframe', padding=(6, 4))
+        flash.pack(fill='x', **pad)
+        self.usb_only_btns = []                         # disabled while "📶 WiFi" is chosen
+        for text, fn, usb in (('💾 Back up flash', self.do_backup, True), ('🔧 Install boot hook', self.do_install, True),
+                              ('↩ Restore original boot', self.do_restore, True),
+                              ('⏻ Reboot camera', self.do_reboot, False), ('📁 Backups folder', self.open_backups, False)):
+            b = button(flash, text, fn, padx=(0, 6), pady=2)
+            if usb:
+                self.usb_only_btns.append(b)
 
         # ---- 2: settings (edited here, stored on this computer)
         sd = ttk.LabelFrame(self, text=' 2 │ Settings  (config.txt) ', style='Section.TLabelframe',
@@ -652,6 +951,23 @@ class App(tk.Tk):
         self.rtsp_link = tk.StringVar()
         ttk.Entry(lf, textvariable=self.rtsp_link, state='readonly', width=48).pack(side='left', padx=4)
         button(lf, '📋 Copy', self.copy_rtsp_link)
+        # Device tab: own startup sound (converted and copied to cam/startup.wav when writing the SD card)
+        sf = ttk.Frame(tabs['Device']); sf.grid(row=50, column=0, columnspan=4, sticky='we', padx=4, pady=(8, 2))
+        ttk.Label(sf, text='Startup sound (WAV):').pack(side='left')
+        ttk.Entry(sf, textvariable=self.sound_path, state='readonly', width=36).pack(side='left', padx=4)
+        button(sf, '📂 Choose...', self.choose_sound)
+        button(sf, '✖', lambda: self.sound_path.set(''), padx=(2, 0))
+        self.usb_only_btns.append(button(sf, '▶ Play on camera (USB)', self.do_play_sound, padx=(6, 0)))
+        ttk.Label(tabs['Device'], style='Hint.TLabel', text=
+                  'Written to cam/startup.wav with the SD card (USB or card reader), played when the camera is on '
+                  'the network.\nNo file chosen = the sound on the card stays. The original power-on sound stays too.'
+                  ).grid(row=51, column=0, columnspan=4, sticky='w', padx=4)
+        ttk.Label(tabs['Remote'], style='Hint.TLabel', justify='left', text=
+                  'With an admin password the camera can be configured over WiFi: choose "📶 WiFi" at the top\n'
+                  'and enter its IP. Read / write settings, WiFi scan, stream link and reboot then work without\n'
+                  'a cable (user name: admin). Over WiFi only config.txt is written, not the programs;\n'
+                  'flash backup and boot hook need USB. A new password takes effect after a restart.'
+                  ).grid(row=50, column=0, columnspan=4, sticky='w', padx=4, pady=(8, 2))
         self._br_suggest = None
         for k in ('RESOLUTION', 'VIDEO_FPS'):
             self.cfg[k].trace_add('write', lambda *_: self.on_video_change())
@@ -665,11 +981,13 @@ class App(tk.Tk):
             self.set_values(default_values())
 
         # ---- 3: write the SD card
-        wr = ttk.LabelFrame(self, text=' 3 │ Write to SD card  (programs + config.txt) ', style='Section.TLabelframe',
-                            padding=(6, 6)); wr.pack(fill='x', **pad)
-        button(wr, '⬆  Write to camera SD card (USB)', self.do_sd_adb, style='Big.TButton', padx=(0, 6))
+        self.write_frame = wr = ttk.LabelFrame(self, style='Section.TLabelframe', padding=(6, 6))
+        wr.pack(fill='x', **pad)
+        self.write_btn = button(wr, '', self.do_sd_adb, style='Big.TButton', padx=(0, 6))
         button(wr, '🖴  Write to drive / folder...', self.do_sd_folder, style='Big.TButton', padx=(0, 6))
         self.protocol('WM_DELETE_WINDOW', self.on_close)
+        self.conn.trace_add('write', lambda *_: self.update_conn_ui())
+        self.update_conn_ui()
 
         logf = ttk.LabelFrame(self, text=' 📝 Log ', style='Section.TLabelframe'); logf.pack(fill='both', expand=True, **pad)
         self.log_box = tk.Text(logf, height=14, wrap='word', font=('Consolas', 9) if WINDOWS else 'TkFixedFont')
@@ -704,21 +1022,66 @@ class App(tk.Tk):
         self.busy = busy
         for b in self.btns:
             b.state(['disabled'] if busy else ['!disabled'])
+        if not busy:
+            self.update_conn_ui()
 
-    def run_task(self, title, fn, need_device=True):
+    def update_conn_ui(self):
+        """Titles, button texts and USB-only buttons follow the 🔌 USB / 📶 WiFi choice."""
+        wifi = self.wifi()
+        self.flash_frame.configure(text=' 1 │ Camera flash  (once per camera%s) '
+                                   % (' – needs 🔌 USB' if wifi else ''))
+        self.write_frame.configure(text=' 3 │ Write to camera  (WiFi: only config.txt, encrypted) ' if wifi
+                                   else ' 3 │ Write to SD card  (programs + config.txt) ')
+        self.write_btn.configure(text='⬆  Write settings to camera (WiFi)' if wifi
+                                 else '⬆  Write to camera SD card (USB)')
+        if not self.busy:
+            for b in self.usb_only_btns:
+                b.state(['disabled'] if wifi else ['!disabled'])
+
+    def wifi(self):
+        return self.conn.get() == 'wifi'
+
+    def camnet(self):
+        """CamNet for the IP at the top and the admin password of the form, or None (message shown)."""
+        ip = self.cam_ip.get().strip()
+        pw = self.cfg['ADMIN_PASSWORD'].get()
+        if not is_ipv4(ip):
+            messagebox.showwarning(APP, 'Enter the camera\'s IP address next to "📶 WiFi" at the top.\n'
+                                        '(With the camera on USB, "Get stream link" on the RTSP tab shows it.)')
+            return None
+        if not pw:
+            messagebox.showwarning(APP, 'Enter the camera\'s admin password on the 🌐 Remote tab '
+                                        '(the ADMIN_PASSWORD in its config.txt).')
+            return None
+        port = self.cfg['ADMIN_PORT'].get().strip() or '8080'
+        return CamNet(ip, port if port.isdigit() else '8080', [pw, getattr(self, '_net_pw_ok', '')])
+
+    def run_task(self, title, fn, need_device=True, usb_only=False):
+        """fn(conn) in a worker thread; conn is an Adb (USB) or a CamNet (WiFi)."""
         if self.busy:
             return
-        if need_device and not self.serial.get():
-            messagebox.showwarning(APP, 'No camera selected. Connect it over USB and press Refresh.')
+        net = None
+        if need_device and self.wifi():
+            if usb_only:
+                messagebox.showwarning(APP, '"%s" needs the camera on USB (choose "🔌 USB" at the top).' % title)
+                return
+            net = self.camnet()
+            if not net:
+                return
+        elif need_device and not self.serial.get():
+            messagebox.showwarning(APP, 'No camera selected. Connect it over USB and press Refresh '
+                                        '(or choose "📶 WiFi" and enter its IP).')
             return
         self.set_busy(True)
-        self.log('--- %s' % title)
+        self.log('--- %s%s' % (title, ' (WiFi %s)' % net.serial if net else ''))
         serial = self.serial.get() or None      # Tk variables are read in the GUI thread only
 
         def worker():
             try:
-                adb = Adb(self.adb_exe, serial) if self.adb_exe else None
+                adb = net or (Adb(self.adb_exe, serial) if self.adb_exe else None)
                 fn(adb)
+                if net:
+                    self._net_pw_ok = net.password      # remembered for this session only
                 self.log('--- done')
             except Exception as e:      # shown to the user, never fatal
                 msg = str(e)            # `e` is deleted when the except block ends
@@ -762,7 +1125,14 @@ class App(tk.Tk):
                 self.cfg[key].set(d.get(key, ''))
         known = {k for _, k, _, _, _ in SETTINGS} | {'VIDEO_WIDTH', 'VIDEO_HEIGHT', 'LED_MODE', 'LED_STREAM', 'BATTERY_CHARGE_LIMIT',
                                                      'LED_STATUS', 'LED_POWER', 'LED_INVERT'}
-        self.extra_cfg = {k: v for k, v in values.items() if k not in known}   # kept when writing
+        self.extra_cfg = {k: v for k, v in values.items()       # kept when writing
+                          if k not in known and not k.startswith('LAMAXTOOL_')}
+        if values.get('LAMAXTOOL_CONNECTION') in ('usb', 'wifi'):
+            self.conn.set(values['LAMAXTOOL_CONNECTION'])
+        if values.get('LAMAXTOOL_CAMERA_IP'):
+            self.cam_ip.set(values['LAMAXTOOL_CAMERA_IP'])
+        if 'LAMAXTOOL_STARTUP_SOUND' in values:
+            self.sound_path.set(values['LAMAXTOOL_STARTUP_SOUND'])
 
     def form_values(self):
         """Current form content as KEY -> value (not validated)."""
@@ -789,8 +1159,12 @@ class App(tk.Tk):
 
     def remember_now(self, values=None):
         """Store the form for the next start."""
+        v = dict(values if values is not None else self.form_values())
+        v['LAMAXTOOL_CONNECTION'] = self.conn.get()
+        v['LAMAXTOOL_CAMERA_IP'] = self.cam_ip.get().strip()
+        v['LAMAXTOOL_STARTUP_SOUND'] = self.sound_path.get()
         try:
-            save_last_settings(values if values is not None else self.form_values())
+            save_last_settings(v)
         except OSError as e:
             self.log('Could not store the settings: %s' % e)
 
@@ -822,6 +1196,10 @@ class App(tk.Tk):
 
     def do_load_camera(self):
         def task(adb):
+            if isinstance(adb, CamNet):
+                text = adb.read_config()
+                self.q.put(lambda: self._load_or_error(text, 'camera %s (WiFi)' % adb.serial))
+                return
             if ' /mnt/extsd ' not in adb.sh('cat /proc/mounts'):
                 raise RuntimeError('The SD card is not mounted on the camera (in USB mass storage mode the '
                                    'card belongs to the PC: use "Load from file..." with the drive instead).')
@@ -849,6 +1227,29 @@ class App(tk.Tk):
     # ---- actions
     def refresh(self):
         if self.busy:
+            return
+        if self.wifi():
+            ip = self.cam_ip.get().strip()
+            if not is_ipv4(ip) or not self.cfg['ADMIN_PASSWORD'].get():
+                self.status.set('WiFi: enter the camera IP above and the admin password on the 🌐 Remote tab')
+                return
+            net = self.camnet()
+            self.status.set('WiFi: connecting to %s ...' % net.serial)
+
+            def worker():
+                try:
+                    st = parse_config(net.get('/api/status', timeout=5))
+                    self._net_pw_ok = net.password
+                    res = re.search(r'res=(\S+)', st.get('STREAM', ''))
+                    on_ext = st.get('USB_POWER') == '1' or st.get('AC_POWER') == '1'
+                    up = float((st.get('UPTIME') or '0').split()[0])
+                    msg = 'WiFi: %s  %s   stream %s   battery %s%%%s   up %d min' % (
+                        st.get('NAME', ''), net.host, res.group(1) if res else '-',
+                        st.get('BATTERY_PCT', '?'), ' (charger)' if on_ext else '', up // 60)
+                except Exception as e:
+                    msg = 'WiFi: %s' % str(e).splitlines()[0]
+                self.q.put(lambda: self.status.set(msg))
+            threading.Thread(target=worker, daemon=True).start()
             return
         if not self.adb_exe:
             if messagebox.askyesno(APP, 'adb (Android platform-tools) was not found.\n\n'
@@ -880,9 +1281,11 @@ class App(tk.Tk):
             self.status.set('camera not responding: %s' % e)
 
     def do_backup(self):
-        self.run_task('Back up flash', lambda adb: backup(adb, adb.serial, self.log))
+        self.run_task('Back up flash', lambda adb: backup(adb, adb.serial, self.log), usb_only=True)
 
     def do_install(self):
+        if self.wifi():
+            return self.run_task('Install boot hook', None, usb_only=True)
         if messagebox.askokcancel(APP, 'Install the SD-card boot hook on camera %s?\n\n'
                                        'The boot partition is rewritten (verified by read-back, the original is '
                                        'restored automatically if verification fails). Do not unplug the camera '
@@ -890,19 +1293,36 @@ class App(tk.Tk):
             self.run_task('Install boot hook', lambda adb: install_hook(adb, adb.serial, self.log))
 
     def do_restore(self):
-        if messagebox.askokcancel(APP, 'Write the original boot partition back from the backup of camera %s?'
+        if self.wifi():
+            return self.run_task('Restore original boot', None, usb_only=True)
+        if messagebox.askokcancel(APP, 'Write the original boot partition back to camera %s?\n\n'
+                                       'Taken from this camera\'s own backup, or from ORIGINAL_FW - only if its '
+                                       'system partition is identical to the camera\'s (checked first).'
                                   % self.serial.get()):
             self.run_task('Restore original boot', lambda adb: restore_boot(adb, adb.serial, self.log))
 
     def do_reboot(self):
-        self.run_task('Reboot', lambda adb: (adb.run('reboot', check=False), self.log('Camera is rebooting.')))
+        def task(adb):
+            if isinstance(adb, CamNet):
+                adb.post('/api/reboot')
+                self.log('Camera is rebooting (back on WiFi in about 30 s).')
+            else:
+                adb.run('reboot', check=False)
+                self.log('Camera is rebooting.')
+        self.run_task('Reboot', task)
 
     def open_backups(self):
-        os.makedirs(BACKUPS, exist_ok=True)
-        if WINDOWS:
-            os.startfile(BACKUPS)
-        else:
-            subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', BACKUPS])
+        """Show the backups folder. On Windows explorer.exe directly: os.startfile (the
+        "open" verb of folders) silently does nothing on some PCs."""
+        try:
+            os.makedirs(BACKUPS, exist_ok=True)
+            if WINDOWS:
+                subprocess.Popen(['explorer.exe', os.path.normpath(BACKUPS)])
+            else:
+                subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', BACKUPS])
+            self.log('Backups folder: %s' % BACKUPS)
+        except OSError as e:
+            messagebox.showerror(APP, 'Could not open the backups folder:\n%s\n\n%s' % (BACKUPS, e))
 
     def do_wifi_scan(self):
         shown = [False]
@@ -938,7 +1358,8 @@ class App(tk.Tk):
         def task(adb):
             link = rtsp_link(adb)
             self.log('Stream: %s' % re.sub(r'(//[^:@/]+:)[^@]+@', r'\1***@', link))   # no password in the log
-            self.q.put(lambda: self.rtsp_link.set(link))
+            ip = re.search(r'(\d+\.\d+\.\d+\.\d+)', link).group(1)
+            self.q.put(lambda: (self.rtsp_link.set(link), self.cam_ip.set(ip)))   # also the WiFi address
         self.run_task('Get the stream link from the camera', task)
 
     def copy_rtsp_link(self):
@@ -957,7 +1378,26 @@ class App(tk.Tk):
             text = make_config(self.config_values())
         except Exception as e:
             messagebox.showerror(APP, str(e)); return
-        self.run_task('Write SD card over adb', lambda adb: write_sd_adb(adb, text, self.log))
+        snd = self.sound_path.get()
+        if not self.wifi():
+            self.run_task('Write SD card over adb', lambda adb: write_sd_adb(
+                adb, text, self.log, convert_sound(snd) if snd else None))
+            return
+
+        def task(net):
+            net.write_config(text)
+            self.log('config.txt written over WiFi, encrypted (the programs are only updated over USB '
+                     'or a card reader).')
+            if snd:
+                self.log('Note: the startup sound is not sent over WiFi - write it over USB or a card reader.')
+
+            def ask():
+                if messagebox.askyesno(APP, 'Settings saved on the camera. They take effect after a restart.\n\n'
+                                            'Restart the camera now?\n\n(If the WiFi settings are wrong, it will not '
+                                            'come back on WiFi - then fix them over USB.)'):
+                    self.after(300, self.do_reboot)
+            self.q.put(ask)
+        self.run_task('Write config.txt over WiFi', task)
 
     def do_sd_folder(self):
         try:
@@ -966,8 +1406,46 @@ class App(tk.Tk):
             messagebox.showerror(APP, str(e)); return
         root = filedialog.askdirectory(title='Select the SD card drive (its root folder)')
         if root:
-            self.run_task('Write SD card to %s' % root,
-                          lambda _: write_sd_folder(root, text, self.log), need_device=False)
+            snd = self.sound_path.get()
+            self.run_task('Write SD card to %s' % root, lambda _: write_sd_folder(
+                root, text, self.log, convert_sound(snd) if snd else None), need_device=False)
+
+    def choose_sound(self):
+        path = filedialog.askopenfilename(title='Startup sound', filetypes=[('WAV sound', '*.wav'), ('all files', '*')])
+        if not path:
+            return
+        try:
+            data = convert_sound(path)
+        except Exception as e:
+            messagebox.showerror(APP, str(e)); return
+        self.sound_path.set(path)
+        self.log('Startup sound: %s (%.1f s on the camera)' % (path, (len(data) - 44) / 2.0 / SOUND_RATE))
+
+    def do_play_sound(self):
+        """Play the chosen sound (or the one on the card) with the camera's own player."""
+        snd = self.sound_path.get()
+
+        def task(adb):
+            if snd:
+                tmp = tempfile.mkdtemp()
+                try:
+                    p = os.path.join(tmp, 'startup.wav')
+                    open(p, 'wb').write(convert_sound(snd))
+                    adb.push(p, '/dev/cam/sound_test.wav')
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                f = '/dev/cam/sound_test.wav'
+            else:
+                f = '/mnt/extsd/cam/startup.wav'
+            out = adb.sh('[ -f %s ] && { /system/bin/startup_music %s 2>&1 & i=0; while [ $i -lt 15 ]; do '
+                         'tinymix -D 0 1 31 >/dev/null; i=$((i+1)); done; wait; }; rm -f /dev/cam/sound_test.wav'
+                         % (f, f))     # the player sets Line Volume 29: back to the maximum 31
+            if 'Error' in out:
+                raise RuntimeError('The camera could not play the sound:\n' + out.strip())
+            if 'Playing' not in out:
+                raise RuntimeError('No sound file: choose one, or write the SD card with one first.')
+            self.log('Played on the camera.')
+        self.run_task('Play the startup sound on the camera', task, usb_only=True)
 
 
 if __name__ == '__main__':
